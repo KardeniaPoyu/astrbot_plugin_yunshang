@@ -1,0 +1,8 @@
+name: astrbot_plugin_yunshang
+display_name: 云上校友圈
+desc: 按需查询民大校园墙最新、热帖、搜索及详情；需配置有效登录 Cookie
+version: v0.1.0
+author: KardeniaPoyu
+repo: https://github.com/KardeniaPoyu/astrbot_plugin_yunshang
+support_platforms:
+  - aiocqhttp

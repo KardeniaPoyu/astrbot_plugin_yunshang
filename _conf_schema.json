@@ -1,0 +1,8 @@
+{
+  "enable": {"description": "启用校园圈查询", "type": "bool", "default": true},
+  "cookie": {"description": "云上校友圈登录 Cookie", "type": "string", "default": "", "hint": "仅填写 ys.qimiaoyuanfen.com 请求的 Cookie 值。留空时模型不可调用。更新后重载插件；不要在群里发送 Cookie。"},
+  "school": {"description": "预期学校（必须完全匹配）", "type": "string", "default": "中央民族大学"},
+  "community": {"description": "预期校园墙（必须完全匹配）", "type": "string", "default": "民大校园墙"},
+  "community_id": {"description": "预期校园墙 ID（可选）", "type": "string", "default": ""},
+  "cache_seconds": {"description": "查询缓存秒数，最高300", "type": "int", "default": 60}
+}

@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*cookie*
+*.har
+*_config.json
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.log
+*.db
+*.db-*
+.venv/
+private/
+data/
