@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageChops, ImageDraw
 
 import cards
 
@@ -72,12 +72,94 @@ class CardsTests(unittest.TestCase):
                 self.assertGreater(im.height, 1000)
             self.assertLess(Path(path).stat().st_size, 2_000_000)
         for expected in ("本期展示", "12:00", "16:00", "北京时间", "AI",
-                         "12", "8", "扫描未完成", "图片未识别", "1 / 2", "2 / 2"):
+                         "12", "8", "扫描未完成", "配图2张", "1 / 2", "2 / 2"):
             self.assertIn(expected, text)
         for i in range(1, 9):
             self.assertEqual(text.count(f"DEMO-{i:03}"), 1)
         self.assertEqual(text.count("寻找周末一起读书的同学"), 8)
         self.assertNotIn("非官方", text)
+
+    def color_region(self, image, color):
+        """Locate source-image pixels with tolerance for JPEG/resampling noise."""
+        difference = ImageChops.difference(image, Image.new("RGB", image.size, color))
+        red, green, blue = difference.split()
+        mask = ImageChops.lighter(ImageChops.lighter(red, green), blue).point(
+            lambda value: 255 if value < 12 else 0)
+        return mask.getbbox(), mask.histogram()[255]
+
+    def test_cached_thumbnail_pixels_preserve_all_corners_and_aspect_ratio(self):
+        colors = ((204, 14, 157), (17, 191, 70), (242, 208, 10), (11, 211, 213))
+        for width, height, displayed in ((1024, 2048, (94, 188)),
+                                          (2048, 1024, (212, 106)),
+                                          (160, 160, (188, 188))):
+            with self.subTest(size=(width, height)):
+                photo = Path(self.temp.name) / "synthetic-corners.jpg"
+                with Image.new("RGB", (width, height)) as source:
+                    draw = ImageDraw.Draw(source)
+                    # Mark all four edges: cover/crop would lose these corner blocks.
+                    draw.rectangle((0, 0, width - 1, height - 1), fill="#ECEFF2")
+                    for box, color in zip((
+                        (0, 0, width // 4, height // 4),
+                        (3 * width // 4, 0, width - 1, height // 4),
+                        (0, 3 * height // 4, width // 4, height - 1),
+                        (3 * width // 4, 3 * height // 4, width - 1, height - 1),
+                    ), colors):
+                        draw.rectangle(box, fill=color)
+                    source.save(photo, quality=95, subsampling=0)
+                digest = fixture(1)
+                digest["items"][0].update(image_path=str(photo), image_count=3)
+                before = copy.deepcopy(digest)
+                original = photo.read_bytes()
+                paths, text = self.render_with_text(digest)
+                self.assertEqual(digest, before)
+                self.assertEqual(photo.read_bytes(), original)
+                self.assertIn("配图3张", text)
+                with Image.open(paths[0]) as rendered:
+                    boxes = []
+                    for color in colors:
+                        box, pixels = self.color_region(rendered, color)
+                        self.assertGreater(pixels, 100, "Source photo pixels must reach the PNG")
+                        boxes.append(box)
+                    left, top = min(b[0] for b in boxes), min(b[1] for b in boxes)
+                    right, bottom = max(b[2] for b in boxes), max(b[3] for b in boxes)
+                    self.assertGreater(left, 700, "Thumbnail belongs beside the text")
+                    self.assertLess(right, 1000)
+                    self.assertAlmostEqual((right - left) / (bottom - top), width / height, delta=0.05)
+                    # Small cache images must fill the padded frame too, after
+                    # the 2x canvas is reduced to the saved PNG's logical pixels.
+                    self.assertAlmostEqual(right - left, displayed[0], delta=2)
+                    self.assertAlmostEqual(bottom - top, displayed[1], delta=2)
+
+    def test_missing_corrupt_and_empty_image_paths_use_identical_text_layout(self):
+        corrupt = Path(self.temp.name) / "corrupt.jpg"
+        corrupt.write_bytes(b"not an image")
+        truncated = Path(self.temp.name) / "truncated.jpg"
+        with Image.new("RGB", (256, 256), "purple") as source:
+            source.save(truncated)
+        truncated.write_bytes(truncated.read_bytes()[:700])
+        digest = fixture(1)
+        digest["items"][0]["image_count"] = 3
+        expected_paths, expected_text = self.render_with_text(digest)
+        with Image.open(expected_paths[0]) as expected:
+            expected_pixels, expected_size = expected.tobytes(), expected.size
+        for image_path in (None, "", Path(self.temp.name) / "missing.jpg", corrupt, truncated):
+            with self.subTest(image_path=image_path):
+                digest["items"][0]["image_path"] = image_path
+                paths, text = self.render_with_text(digest)
+                self.assertEqual(text, expected_text)
+                with Image.open(paths[0]) as rendered:
+                    self.assertEqual(rendered.size, expected_size)
+                    self.assertEqual(rendered.tobytes(), expected_pixels)
+
+    def test_footer_keeps_commands_without_fixed_disclaimers(self):
+        for mode in ("ai", "excerpt"):
+            with self.subTest(mode=mode):
+                _, text = self.render_with_text(fixture(2, mode=mode))
+                for banned in ("未经核实", "图片未识别", "附图未识别"):
+                    self.assertNotIn(banned, text)
+                self.assertIn("/校园圈 详情", text)
+                self.assertIn("/校园圈 图片", text)
+                self.assertIn("原帖 #DEMO-001", text)
 
     def test_fifth_post_survives_pagination_boundary(self):
         paths, text = self.render_with_text(fixture(5))
@@ -116,15 +198,27 @@ class CardsTests(unittest.TestCase):
     def test_worst_case_layout_has_no_off_canvas_text_and_caps_eight_items(self):
         digest = fixture(11, scan_limited=True, intro="很长的介绍，" * 3000,
                          community="很长的校园墙名称" * 3000)
-        for item in digest["items"]:
+        colors = [(90 + i * 20, 12, 170) for i in range(8)]
+        for i, item in enumerate(digest["items"]):
+            photo = Path(self.temp.name) / f"synthetic-{i}.jpg"
+            with Image.new("RGB", (2048, 1536), colors[i % 8]) as source:
+                source.save(photo, quality=95, subsampling=0)
             item.update(title="长标题（中英文 Mixed）：" * 3000,
                         summary=("超长段落👩‍🎓😀\n\n" + "Token" * 400) * 20,
-                        category="很长的分类名称" * 200, image_count=99)
+                        category="很长的分类名称" * 200, image_count=99,
+                        image_path=photo)
         paths, text = self.render_with_text(digest)
         self.assertEqual(len(paths), 2)
-        for path in paths:
+        for page, path in enumerate(paths):
             with Image.open(path) as im:
+                self.assertEqual(im.width, 1080)
                 self.assertLessEqual(im.height, 2400)
+                for i, color in enumerate(colors):
+                    _, pixels = self.color_region(im, color)
+                    if page * 4 <= i < (page + 1) * 4:
+                        self.assertGreater(pixels, 1000, f"Missing thumbnail for item {i + 1}")
+                    else:
+                        self.assertEqual(pixels, 0, "Only four thumbnails belong on each page")
         self.assertIn("…", text)
         self.assertNotIn("DEMO-009", text)
         self.assertIn("DEMO-008", text)

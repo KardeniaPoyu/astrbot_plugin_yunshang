@@ -61,6 +61,44 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await c.close()
 
+    async def test_post_pictures_keep_cdn_originals_and_thumbnails(self):
+        base='https://ysxy.img.qimiaoyuanfen.com/'
+        self.posts=[{**POST,'images':base+'first.jpg,'+base+'second.jpg',
+                     'show_images':[{'ori':base+'first.jpg','listThumb':base+'first.jpg?size=small',
+                                     'infoThumb':base+'first.jpg?size=medium'},
+                                    {'ori':base+'second.jpg','infoThumb':base+'second.jpg?size=medium'}]}]
+        post=(await self.client.query())['posts'][0]
+        self.assertEqual(post['image_count'],2)
+        self.assertEqual(post['image_urls'],[base+'first.jpg',base+'second.jpg'])
+        self.assertEqual(post['thumbnail_urls'],[base+'first.jpg?size=medium',base+'second.jpg?size=medium'])
+
+    async def test_post_picture_hosts_cannot_escape_the_campus_cdn(self):
+        self.posts=[{**POST,'images':'http://127.0.0.1/secret,https://other.invalid/photo.jpg',
+                     'show_images':[{'ori':'https://other.invalid/photo.jpg'}]}]
+        post=(await self.client.query())['posts'][0]
+        self.assertEqual(post['image_urls'],[])
+        self.assertEqual(post['thumbnail_urls'],[])
+
+    async def test_rejected_thumbnail_does_not_shift_other_image_fallbacks(self):
+        base = 'https://ysxy.img.qimiaoyuanfen.com/'
+        self.posts = [{**POST, 'show_images': [
+            {'ori': base+'first.jpg', 'listThumb': 'https://other.invalid/first.jpg'},
+            {'ori': base+'second.jpg', 'listThumb': base+'second-small.jpg'}]}]
+        post = (await self.client.query())['posts'][0]
+        self.assertEqual(post['image_urls'], [base+'first.jpg', base+'second.jpg'])
+        self.assertEqual(post['thumbnail_urls'], [base+'first.jpg', base+'second-small.jpg'])
+
+    async def test_duplicate_and_rejected_originals_keep_thumbnail_pairs(self):
+        base = 'https://ysxy.img.qimiaoyuanfen.com/'
+        self.posts = [{**POST, 'images': base+'first.jpg,'+base+'third.jpg', 'show_images': [
+            {'ori': 'https://other.invalid/photo.jpg', 'listThumb': base+'unpaired.jpg'},
+            {'ori': base+'first.jpg', 'listThumb': base+'first-small.jpg'},
+            {'ori': base+'first.jpg', 'listThumb': base+'duplicate.jpg'},
+            {'ori': base+'second.jpg', 'listThumb': base+'second-small.jpg'}]}]
+        post = (await self.client.query())['posts'][0]
+        self.assertEqual(post['image_urls'], [base+'first.jpg', base+'second.jpg', base+'third.jpg'])
+        self.assertEqual(post['thumbnail_urls'], [base+'first-small.jpg', base+'second-small.jpg', base+'third.jpg'])
+
     async def test_auth_failure_not_empty_and_not_retried(self):
         self.responses['/article/article/lists'] = {'code': '7001', 'message': '请先登录', 'data': []}
         with self.assertRaises(CampusError) as caught:
@@ -448,7 +486,7 @@ class WindowTests(unittest.IsolatedAsyncioTestCase):
         out = await self.client.fetch_window(self.start, self.end)
         post = out['posts'][0]
         self.assertEqual(set(post), {'id', 'text', 'truncated', 'published_at',
-                                     'category', 'image_count', 'source'})
+                                     'category', 'image_count', 'source', 'image_urls', 'thumbnail_urls'})
         self.assertEqual(len(post['text']), 2000)
         self.assertTrue(post['truncated'])
         self.assertFalse(out['posts'][1]['truncated'])

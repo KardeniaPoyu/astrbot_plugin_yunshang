@@ -31,7 +31,7 @@ class DigestTests(unittest.TestCase):
         post={**POST,'text':'','image_count':2}
         d=build_digest(self.collection([post]),START,END,ai_reply=json.dumps({'items':[{'id':'42','title':'猜图','summary':'图片里有猫。'}]}))
         self.assertEqual(d['mode'],'excerpt')
-        self.assertIn('尚未识别',d['items'][0]['summary'])
+        self.assertEqual(d['items'][0]['summary'],'这条投稿以配图为主。')
 
     def test_redacts_model_contact_information(self):
         d=build_digest(self.collection(),START,END,ai_reply=json.dumps({'items':[{'id':'42','title':'电话13800138000','summary':'QQ：123456789'}]}))
@@ -189,7 +189,7 @@ class DigestTests(unittest.TestCase):
         self.assertEqual([p['id'] for p in digest['items']], ['42', '43', '44', '45'])
         self.assertEqual(digest['items'][0]['summary'], POST['text'])
         self.assertEqual(digest['items'][1]['summary'], '同学询问打羽毛球的伙伴。')
-        self.assertIn('尚未识别', digest['items'][2]['summary'])
+        self.assertEqual(digest['items'][2]['summary'],'这条投稿以配图为主。')
         self.assertEqual(digest['items'][3]['summary'], posts[3]['text'])
         self.assertEqual((digest['total'], digest['shown']), (4, 4))
         self.assertTrue(all('text' not in item for item in digest['items']))
@@ -204,5 +204,10 @@ class DigestTests(unittest.TestCase):
         self.assertTrue(digest['intro'])
         for unsupported in ('学校', '明日', '停课', '500'):
             self.assertNotIn(unsupported, digest['intro'])
+
+    def test_digest_has_no_fixed_disclaimer(self):
+        digest=build_digest(self.collection(),START,END)
+        self.assertNotIn('未经核实',digest['intro'])
+        self.assertNotIn('未经核实',digest_as_text(digest))
 
 if __name__=='__main__':unittest.main()

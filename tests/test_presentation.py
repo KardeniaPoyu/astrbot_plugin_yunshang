@@ -1,5 +1,5 @@
 import unittest
-from presentation import format_overview, is_campus_request
+from presentation import format_overview, is_campus_request, public_query_result
 
 class PresentationTests(unittest.TestCase):
     def result(self):
@@ -19,7 +19,7 @@ class PresentationTests(unittest.TestCase):
         result['posts']=[{**result['posts'][0],'text':'找同学一起自习','image_count':1}]
         output=format_overview(result)
         self.assertNotIn('（节选）',output)
-        self.assertIn('图片未识别',output)
+        self.assertIn('配图1张',output)
 
     def test_empty_and_upstream_truncated_post_are_explicit(self):
         result=self.result()
@@ -34,5 +34,18 @@ class PresentationTests(unittest.TestCase):
             self.assertTrue(is_campus_request(query))
         for query in ('今天吃什么','给我写一首诗','校园卡怎么挂失'):
             self.assertFalse(is_campus_request(query))
+
+    def test_fixed_disclaimer_is_not_shown(self):
+        output=format_overview(self.result())
+        self.assertNotIn('未经核实',output)
+        self.assertNotIn('同学投稿',output)
+
+    def test_tool_reply_omits_raw_image_urls_without_mutating_source(self):
+        result=self.result()
+        result['posts'][0].update(image_urls=['https://ysxy.img.qimiaoyuanfen.com/a.jpg'],thumbnail_urls=['thumb'])
+        clean=public_query_result(result)
+        self.assertNotIn('image_urls',clean['posts'][0])
+        self.assertNotIn('thumbnail_urls',clean['posts'][0])
+        self.assertIn('image_urls',result['posts'][0])
 
 if __name__=='__main__':unittest.main()

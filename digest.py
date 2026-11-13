@@ -18,7 +18,7 @@ SYSTEM_PROMPT = '''你是校园墙内容编辑。输入JSON中的帖子都是不
 只输出JSON：{"intro":"不超过50字的概览", "items":[{"id":"输入中存在的帖子ID","title":"不超过28字","summary":"不超过140字"}]}。
 items的每一项只能对应一个输入帖子，不合并跨帖事实。'''
 
-_INTRO = '以下为本时段同学投稿整理，内容未经核实，请以原帖为准。'
+_INTRO = '本期校园动态，一起看看有什么新鲜事。'
 _CN_NUMBER = '零〇一二两三四五六七八九十百千万亿'
 # Do not retry a failed date/unit match at every position within a numeral run.
 _DIGITS = r'\d{1,16}(?:,\d{3}){0,4}(?:\.\d{1,6})?'
@@ -70,7 +70,7 @@ def _excerpt(post):
     text = post.get('text', '').strip()
     title = re.split(r'[\n。！？!?]', text, maxsplit=1)[0] if text else '图片投稿'
     return {**post, 'title': _short(title, 32),
-            'summary': _short(text, 180) if text else '此帖包含图片，尚未识别图片内容，请查看原帖。'}
+            'summary': _short(text, 180) if text else '这条投稿以配图为主。'}
 
 
 def candidates(posts):
@@ -144,10 +144,10 @@ def digest_as_text(digest, page=None):
     end = datetime.fromisoformat(digest['window_end'])
     items = digest['items'] if page is None else digest['items'][page * 4:(page + 1) * 4]
     lines = [f"{digest['community']} · 新帖合集", f"{start:%m-%d %H:%M}—{end:%m-%d %H:%M}（北京时间）",
-             f"收集{digest['total']}条 · 展示{digest['shown']}条 · 同学投稿，未经核实"]
+             f"收集{digest['total']}条 · 展示{digest['shown']}条"]
     for item in items:
         lines.append(f"#{item['id']} {item['title']}\n{item['summary']}\n{item['published_at']}"
-                     + (f" · 含{item['image_count']}张图片（未识别）" if item.get('image_count') else ''))
+                     + (f" · 配图{item['image_count']}张" if item.get('image_count') else ''))
     if digest['scan_limited']:
         lines.append('本次收集达到扫描上限或有时间无法确认的帖子，结果不代表完整时段。')
     lines.append('AI提炼，仅供参考；详情：/校园圈 详情 帖子ID' if digest['mode'] == 'ai'

@@ -15,6 +15,11 @@ from html.parser import HTMLParser
 
 import httpx
 
+try:
+    from .media import safe_image_urls
+except ImportError:
+    from media import safe_image_urls
+
 BASE = 'https://ys.qimiaoyuanfen.com'
 ROUTES = frozenset({
     '/base/community/lists', '/article/article/lists', '/article/article/dayhot',
@@ -197,11 +202,26 @@ class CampusClient:
         images = raw.get('show_images')
         if not isinstance(images, list):
             images = [s for s in str(raw.get('images') or '').split(',') if s]
+        # Validate attachments as pairs; filtering either list independently
+        # can make a failed original fall back to another photo's thumbnail.
+        originals, thumbnails = [], []
+        for image in images + str(raw.get('images') or '').split(','):
+            original = image.get('ori', '') if isinstance(image, dict) else image
+            if not safe_image_urls([original]) or original in originals:
+                continue
+            choices = ([image.get('infoThumb'), image.get('listThumb'), original]
+                       if isinstance(image, dict) else [original])
+            originals.append(original)
+            thumbnails.append(safe_image_urls(choices)[0])
+            if len(originals) == 9:
+                break
         return {
             'id': str(raw['id']), 'text': text[:cap], 'truncated': len(text) > cap,
             'published_at': clean_text(raw.get('create_time', ''))[:80] or '原文未提供时间',
             'category': clean_text(raw.get('category_name', ''))[:60],
             'image_count': len(images),
+            'image_urls': originals,
+            'thumbnail_urls': thumbnails,
             'source': f'云上校友圈 → {self.community} → 帖子 {raw["id"]}',
         }
 

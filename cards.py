@@ -5,6 +5,7 @@ page order; the caller owns their lifecycle. Catch ``RenderError`` to use the
 text fallback. There is no network access or persistent state in this module.
 """
 
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import os
@@ -26,6 +27,9 @@ WIDTH = 1080
 MAX_HEIGHT = 2400
 _CST = timezone(timedelta(hours=8))
 _SCALE = 2  # Draw at 2x and downsample: Pillow shapes are not anti-aliased.
+_THUMB_SIZE = (232, 208)
+_THUMB_PAD = 10
+_THUMB_GAP = 24
 # Neutral text/surface tokens follow Lark (Feishu) UD; tags and alerts reuse
 # Ant Design v5 preset palettes, so the card reads like a familiar IM card.
 _BG = "#F2F3F5"
@@ -314,6 +318,30 @@ def _tag_color(category):
     return _TAGS[_TAG_FALLBACK[sum(map(ord, category)) % len(_TAG_FALLBACK)]]
 
 
+def _load_thumbnail(image_path):
+    """Read one trusted cache JPEG; failed/expired files leave a text-only item.
+
+    The caller normalizes orientation and caps each edge at 2048px. Decode now
+    so truncated images cannot fail later during drawing. Never fetch a URL.
+    The returned RGB image is owned by the current render, not by the cache.
+    """
+    if not image_path:
+        return None
+    try:
+        with Image.open(Path(image_path), formats=("JPEG",)) as source:
+            if max(source.size) > 2048:
+                return None
+            with source.convert("RGB") as thumbnail:
+                bounds = tuple((edge - 2 * _THUMB_PAD) * _SCALE for edge in _THUMB_SIZE)
+                fit = min(bounds[0] / thumbnail.width, bounds[1] / thumbnail.height)
+                # Fit in both directions at canvas resolution, including upscale:
+                # thumbnail() alone leaves small cache images tiny after downsampling.
+                size = tuple(max(1, round(edge * fit)) for edge in thumbnail.size)
+                return thumbnail.resize(size, Image.LANCZOS)
+    except (OSError, ValueError, TypeError, Image.DecompressionBombError):
+        return None
+
+
 class _Canvas:
     """Logical-pixel drawing on a supersampled image; text must stay in bounds."""
 
@@ -380,6 +408,14 @@ class _Canvas:
                                    cx + 4, cy + 1, cx + 7, cy + 5)), fill=color)
         self.ellipse((cx + 2, cy - 5, cx + 6, cy - 1), fill=color)
 
+    def thumbnail(self, x, y, image):
+        width, height = _THUMB_SIZE
+        self.box((x, y, x + width, y + height), 12, "#F7F8FA", _BORDER)
+        # Contain within an inset frame: even screenshot corners stay visible.
+        left = round(x * _SCALE) + (width * _SCALE - image.width) // 2
+        top = round(y * _SCALE) + (height * _SCALE - image.height) // 2
+        self.image.paste(image, (left, top))
+
     def badge(self, cx, cy, glyph, fill, ink="#FFFFFF"):
         """Filled round status icon (info / warning) with a centered glyph."""
         self.ellipse((cx - 11, cy - 11, cx + 11, cy + 11), fill=fill)
@@ -391,23 +427,25 @@ class _Canvas:
         return result
 
 
-def _item_layout(item, canvas, start, number):
+def _item_layout(item, canvas, start, number, thumbnail):
     clean = canvas.fonts.clean
-    title = canvas.wrap(clean(item["title"], 320) or "同学分享", 32, 920, 2, bold=True)
-    summary = canvas.wrap(clean(item["summary"]) or "请查看原帖了解详情。", 26, 920, 3)
+    text_width = 920 - _THUMB_SIZE[0] - _THUMB_GAP if thumbnail is not None else 920
+    title = canvas.wrap(clean(item["title"], 320) or "同学分享", 32, text_width, 2, bold=True)
+    summary = canvas.wrap(clean(item["summary"]) or "请查看原帖了解详情。", 26, text_width, 3)
     category = canvas.wrap(clean(item["category"], 64).replace("\n", " ") or "校园日常", 19, 560, 1)[0]
     source = canvas.wrap("原帖 #" + clean(item["id"], 128).replace("\n", " "), 20, 520, 1)[0]
     images = ""
     if item["image_count"]:
         count = str(item["image_count"]) if item["image_count"] < 1000 else "999+"
-        images = f"{count} 张图片未识别"
+        images = f"配图{count}张"
     when = canvas.wrap(_published(item["published_at"], start), 20, 300, 1)[0]
-    # Padding 28 + tag row 32 + 18, title 44/line, 10, summary 39/line, 18,
-    # divider, 16 + meta row 24 + padding 24. Advances exceed the ink height.
-    height = 28 + 32 + 18 + 44 * len(title) + 10 + 39 * len(summary) + 18 + 16 + 24 + 24
+    # The image shares the bounded title/summary block instead of adding a row.
+    body_height = max(44 * len(title) + 10 + 39 * len(summary),
+                      _THUMB_SIZE[1] if thumbnail is not None else 0)
+    height = 28 + 32 + 18 + body_height + 18 + 16 + 24 + 24
     return dict(title=title, summary=summary, category=category, source=source,
                 images=images, when=when, height=height, number=number,
-                colors=_tag_color(category))
+                colors=_tag_color(category), thumbnail=thumbnail, body_height=body_height)
 
 
 def _draw_item(canvas, item, y):
@@ -422,6 +460,9 @@ def _draw_item(canvas, item, y):
     canvas.text((right, row + 16), item["when"], 20, _TEXT_3, anchor="rm")
     canvas.clock(right - when_width - 18, row + 16, _TEXT_3)
     row += 32 + 18
+    body_top = row
+    if item["thumbnail"] is not None:
+        canvas.thumbnail(right - _THUMB_SIZE[0], row, item["thumbnail"])
     for line in item["title"]:
         canvas.text((left, row), line, 32, _TEXT, bold=True)
         row += 44
@@ -429,7 +470,7 @@ def _draw_item(canvas, item, y):
     for line in item["summary"]:
         canvas.text((left, row), line, 26, _TEXT_2)
         row += 39
-    row += 18
+    row = body_top + item["body_height"] + 18
     canvas.line(((left, row), (right, row)), _DIVIDER)
     row += 16 + 12
     canvas.text((left, row), item["source"], 20, _TEXT_3, anchor="lm")
@@ -494,14 +535,15 @@ def _overview(canvas, digest, start, end, shown, intro, y):
     return height
 
 
-def _page(digest, start, end, items, fonts, page_index, pages, shown):
+def _page(digest, start, end, items, fonts, page_index, pages, shown, thumbnails):
     hours = f"{(end - start).total_seconds() / 3600:g}"
     probe = _Canvas(fonts, 1)  # Measure with the exact supersampled fonts.
     probe.image.close()
     intro_text = fonts.clean(digest["intro"], 512) or "把刚刚发生的校园小事，收进这一页。"
     intro = probe.wrap(intro_text, 23, 880, 2)
-    layouts = [_item_layout(item, probe, start, page_index * 4 + i + 1) for i, item in enumerate(items)]
-    notice = probe.wrap("同学投稿，内容未经核实，附图未识别。查看全文请发送 /校园圈 详情 <帖子ID>。",
+    layouts = [_item_layout(item, probe, start, page_index * 4 + i + 1, thumbnails[i])
+               for i, item in enumerate(items)]
+    notice = probe.wrap("查看全文：/校园圈 详情 <帖子ID>　查看配图：/校园圈 图片 <帖子ID>",
                         19, 900, 2)
     overview_top = 232
     overview = 172 + 24 + 36 * len(intro) + 26
@@ -563,6 +605,12 @@ def render_digest(digest: dict, output_dir, font_path="") -> list[str]:
     the displayed count always matches the actual rendered selection. An empty
     selection returns [] without requiring Pillow, a font, or an output folder.
     Each call uses unique filenames and removes its own files if any page fails.
+
+    An item's optional ``image_path`` is a trusted local cache JPEG (str/Path),
+    already orientation-normalized with edges <=2048px. One contained thumbnail
+    is shown; ``image_count`` remains the total number of original attachments.
+    Missing, unreadable or corrupt images use the unchanged full-width text
+    layout. This renderer never downloads, changes or deletes the cached image.
     """
     created = []
     pending = None
@@ -578,8 +626,15 @@ def render_digest(digest: dict, output_dir, font_path="") -> list[str]:
         for index in range(pages):
             output = directory / f"{batch}-{index + 1:02}.png"
             pending = output.with_suffix(".tmp")
-            image = _page(digest, start, end, selected[index * 4:(index + 1) * 4],
-                          fonts, index, pages, len(selected))
+            items = selected[index * 4:(index + 1) * 4]
+            with ExitStack() as resources:
+                thumbnails = []
+                for item in items:
+                    thumbnail = _load_thumbnail(item.get("image_path"))
+                    thumbnails.append(resources.enter_context(thumbnail)
+                                      if thumbnail is not None else None)
+                image = _page(digest, start, end, items, fonts, index, pages,
+                              len(selected), thumbnails)
             try:
                 image.save(pending, format="PNG", optimize=True)
             finally:
