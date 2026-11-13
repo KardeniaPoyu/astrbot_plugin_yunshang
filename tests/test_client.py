@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import unittest
+from datetime import datetime, timedelta, timezone
 
 import httpx
 
@@ -11,6 +12,7 @@ from client import CampusClient, CampusError, _private_http
 SCHOOL = {"current_community_id": 37, "current_community_name": "民大校园墙",
           "current_community_school_name": "中央民族大学"}
 POST = {"id": 91, "community_id": 37, "detail": "聚雅餐厅今日讨论", "create_time": "2026-11-13 12:00:00"}
+BEIJING = timezone(timedelta(hours=8))
 
 
 class ClientTests(unittest.IsolatedAsyncioTestCase):
@@ -197,6 +199,297 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(CampusError):
             await self.client.query('latest')
         self.assertFalse(_private_http.get())
+
+
+class WindowTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.calls = []
+        self.school = dict(SCHOOL)
+        self.pages = {}
+        self.total = None
+        self.scope_reads = 0
+        self.final_school = None
+        self.start = datetime(2020, 1, 2, 8, tzinfo=BEIJING)
+        self.end = datetime(2020, 1, 2, 12, tzinfo=BEIJING)
+
+        def handler(request):
+            body = json.loads(request.content)
+            self.calls.append((request, body))
+            if request.url.path == '/base/community/lists':
+                self.scope_reads += 1
+                data = (self.final_school if self.scope_reads > 1
+                        and self.final_school is not None else self.school)
+            elif request.url.path == '/article/article/lists':
+                rows = self.pages.get(body['page'], [])
+                if isinstance(rows, httpx.Response):
+                    return rows
+                data = {'list': rows}
+                if self.total is not None:
+                    data['total'] = self.total
+            else:
+                self.fail(f'Unexpected endpoint: {request.url.path}')
+            return httpx.Response(200, json={'code': '0000', 'data': data})
+
+        self.client = CampusClient('PHPSESSID=example', transport=httpx.MockTransport(handler))
+
+    async def asyncTearDown(self):
+        await self.client.close()
+
+    def post(self, post_id, date='2020-01-02 10:00:00', **fields):
+        return dict(POST, id=post_id, create_time=date, **fields)
+
+    def feed_bodies(self):
+        return [body for req, body in self.calls if req.url.path == '/article/article/lists']
+
+    async def test_multiple_pages_use_fixed_host_and_sort_unique_window_posts(self):
+        self.pages = {
+            1: [self.post(1, '2019-12-01 00:00:00'), self.post(5, '2020-01-02 11:30:00')],
+            2: [self.post('5', '2020-01-02 11:30:00'), self.post(4, '2020-01-02 10:00:00')],
+            3: [self.post(3, '2020-01-02 08:00:00'), self.post(2, '2020-01-02 07:59:59')],
+        }
+        self.total = '5'
+        out = await self.client.fetch_window(self.start, self.end, page_size=2)
+        self.assertEqual([p['id'] for p in out['posts']], ['5', '4', '3'])
+        self.assertEqual(set(out), {'posts', 'total', 'scanned', 'scan_limited', 'invalid_dates'})
+        self.assertEqual(out['total'], 3)
+        self.assertEqual(out['scanned'], 6)
+        self.assertEqual(out['invalid_dates'], 0)
+        self.assertFalse(out['scan_limited'])
+        self.assertEqual(self.feed_bodies(), [{'page': i, 'pageSize': 2} for i in (1, 2, 3)])
+        self.assertEqual(self.scope_reads, 2)
+        for req, _ in self.calls:
+            self.assertEqual(req.url.host, 'ys.qimiaoyuanfen.com')
+            self.assertEqual(req.method, 'POST')
+            self.assertEqual(req.headers['cookie'], 'PHPSESSID=example')
+
+    async def test_beijing_start_inclusive_end_exclusive_with_utc_bounds(self):
+        self.pages = {1: [self.post(1, '2020-01-02 12:00:00'),
+                          self.post(2, '2020-01-02 11:59:59'),
+                          self.post(3, '2020-01-02 08:00:00'),
+                          self.post(4, '2020-01-02 07:59:59')]}
+        self.total = 4
+        out = await self.client.fetch_window(self.start.astimezone(timezone.utc),
+                                             self.end.astimezone(timezone.utc))
+        self.assertEqual([p['id'] for p in out['posts']], ['2', '3'])
+        self.assertFalse(out['scan_limited'])
+
+    async def test_valid_timestamps_with_explicit_offsets_sort_by_instant(self):
+        self.pages = {1: [self.post(1, '2020-01-02T01:30:00Z'),
+                          self.post(2, '2020-01-02T10:00:00+08:00')]}
+        self.total = 2
+        out = await self.client.fetch_window(self.start, self.end)
+        self.assertEqual([p['id'] for p in out['posts']], ['2', '1'])
+        self.assertEqual(out['invalid_dates'], 0)
+
+    async def test_fully_old_first_page_of_pins_does_not_hide_next_page(self):
+        self.pages = {1: [self.post(1, '2019-01-01 00:00:00')],
+                      2: [self.post(2)], 3: [self.post(3, '2020-01-02 07:00:00')]}
+        out = await self.client.fetch_window(self.start, self.end, page_size=1)
+        self.assertEqual([p['id'] for p in out['posts']], ['2'])
+        self.assertEqual(len(self.feed_bodies()), 3)
+        self.assertFalse(out['scan_limited'])
+
+    async def test_duplicate_only_old_page_is_not_a_boundary_or_exhausted_total(self):
+        pin = self.post(1, '2019-01-01 00:00:00')
+        self.pages = {1: [pin], 2: [pin], 3: [self.post(2)]}
+        self.total = 2
+        out = await self.client.fetch_window(self.start, self.end, page_size=1)
+        self.assertEqual([p['id'] for p in out['posts']], ['2'])
+        self.assertEqual(len(self.feed_bodies()), 3)
+        self.assertFalse(out['scan_limited'])
+
+    async def test_duplicates_within_and_across_pages_are_returned_once(self):
+        self.pages = {1: [self.post(1), self.post('1')],
+                      2: [self.post(1), self.post(2, '2020-01-02 09:00:00')]}
+        self.total = 2
+        out = await self.client.fetch_window(self.start, self.end, page_size=2)
+        self.assertEqual([p['id'] for p in out['posts']], ['1', '2'])
+        self.assertEqual(out['total'], 2)
+        self.assertEqual(out['scanned'], 4)
+
+    async def test_all_duplicate_pages_reach_cap_without_claiming_complete(self):
+        self.pages = {i: [self.post(1, '2019-01-01 00:00:00')] for i in range(1, 11)}
+        self.total = 2
+        out = await self.client.fetch_window(self.start, self.end)
+        self.assertEqual(out['posts'], [])
+        self.assertEqual(out['scanned'], 10)
+        self.assertTrue(out['scan_limited'])
+        self.assertEqual(self.feed_bodies(), [{'page': i, 'pageSize': 20} for i in range(1, 11)])
+
+    async def test_fully_old_second_page_stops_before_page_cap(self):
+        self.pages = {1: [self.post(1)], 2: [self.post(2, '2020-01-02 07:59:59')]}
+        self.total = 1000
+        out = await self.client.fetch_window(self.start, self.end)
+        self.assertEqual(out['total'], 1)
+        self.assertEqual(len(self.feed_bodies()), 2)
+        self.assertFalse(out['scan_limited'])
+
+    async def test_missing_and_invalid_dates_do_not_prove_an_old_page_boundary(self):
+        missing = self.post(2)
+        missing.pop('create_time')
+        self.pages = {
+            1: [self.post(1)],
+            2: [self.post(3, '2020-01-02 07:00:00'), missing,
+                self.post(4, 'not a date'), self.post(5, '2020-02-30 10:00:00'),
+                self.post(6, '2020-01-02'), self.post(7, None), self.post(8, 1577923200)],
+            3: [self.post(9, '2020-01-02 08:30:00')],
+        }
+        out = await self.client.fetch_window(self.start, self.end)
+        self.assertEqual([p['id'] for p in out['posts']], ['1', '9'])
+        self.assertEqual(out['invalid_dates'], 6)
+        self.assertTrue(out['scan_limited'])
+        self.assertEqual(len(self.feed_bodies()), 4)
+
+    async def test_future_dates_are_excluded_even_if_inside_requested_window(self):
+        future = (datetime.now(timezone.utc) + timedelta(days=2)).astimezone(BEIJING)
+        self.pages = {1: [self.post(2, future.isoformat()), self.post(1)]}
+        self.total = 2
+        out = await self.client.fetch_window(self.start, future + timedelta(hours=1))
+        self.assertEqual([p['id'] for p in out['posts']], ['1'])
+        self.assertEqual(out['invalid_dates'], 0)
+        self.assertTrue(out['scan_limited'])
+
+    async def test_empty_feed_is_complete(self):
+        out = await self.client.fetch_window(self.start, self.end)
+        self.assertEqual(out, {'posts': [], 'total': 0, 'scanned': 0,
+                               'scan_limited': False, 'invalid_dates': 0})
+        self.assertEqual(len(self.feed_bodies()), 1)
+        self.assertEqual(self.scope_reads, 2)
+
+    async def test_feed_without_window_matches_is_complete(self):
+        self.pages = {1: [self.post(1, '2020-01-02 14:00:00'),
+                          self.post(2, '2020-01-02 06:00:00')]}
+        self.total = 2
+        out = await self.client.fetch_window(self.start, self.end)
+        self.assertEqual(out['total'], 0)
+        self.assertFalse(out['scan_limited'])
+
+    async def test_short_page_without_total_does_not_prove_exhaustion(self):
+        self.pages = {1: [self.post(1)], 2: [self.post(2, '2020-01-02 09:00:00')]}
+        out = await self.client.fetch_window(self.start, self.end)
+        self.assertEqual(out['total'], 2)
+        self.assertEqual(len(self.feed_bodies()), 3)
+        self.assertFalse(out['scan_limited'])
+
+    async def test_cap_reports_incomplete_while_exhaustion_on_last_page_is_complete(self):
+        self.pages = {1: [self.post(1)], 2: [self.post(2, '2020-01-02 09:00:00')]}
+        for total, limited in [(None, True), (100, True), (2, False)]:
+            with self.subTest(total=total):
+                self.total = total
+                self.calls.clear()
+                out = await self.client.fetch_window(self.start, self.end, max_pages=2, page_size=1)
+                self.assertEqual(out['scan_limited'], limited)
+                self.assertEqual(out['total'], 2)
+                self.assertEqual(len(self.feed_bodies()), 2)
+
+    async def test_default_scan_is_bounded_to_200_rows(self):
+        self.pages = {i: [self.post(i * 20 + j) for j in range(20)] for i in range(1, 12)}
+        out = await self.client.fetch_window(self.start, self.end)
+        self.assertEqual(out['scanned'], 200)
+        self.assertEqual(out['total'], 200)
+        self.assertTrue(out['scan_limited'])
+        self.assertEqual(len(self.feed_bodies()), 10)
+
+    async def test_mid_fetch_login_failure_raises_without_partial_success(self):
+        self.pages = {1: [self.post(1)], 2: httpx.Response(200, json={'code': '7001', 'data': []})}
+        with self.assertRaises(CampusError) as caught:
+            await self.client.fetch_window(self.start, self.end)
+        self.assertEqual(caught.exception.code, 'login_expired')
+        self.assertTrue(self.client.expired)
+        self.assertFalse(self.client.cache)
+        self.assertEqual(len(self.feed_bodies()), 2)
+        count = len(self.calls)
+        with self.assertRaises(CampusError):
+            await self.client.fetch_window(self.start, self.end)
+        self.assertEqual(len(self.calls), count)
+
+    async def test_scope_change_after_collection_rejects_entire_batch(self):
+        self.pages = {1: [self.post(1)]}
+        self.total = 1
+        # Same display names, different community ID must still be rejected.
+        self.final_school = dict(SCHOOL, current_community_id=38)
+        with self.assertRaises(CampusError) as caught:
+            await self.client.fetch_window(self.start, self.end)
+        self.assertEqual(caught.exception.code, 'community_mismatch')
+        self.assertEqual(self.scope_reads, 2)
+
+    async def test_wrong_initial_scope_never_fetches_feed(self):
+        self.school['current_community_school_name'] = '其他大学'
+        with self.assertRaises(CampusError) as caught:
+            await self.client.fetch_window(self.start, self.end)
+        self.assertEqual(caught.exception.code, 'community_mismatch')
+        self.assertFalse(self.feed_bodies())
+
+    async def test_wrong_community_is_rejected_even_for_excluded_or_duplicate_rows(self):
+        for bad in [self.post(2, '2019-01-01 00:00:00', community_id=99),
+                    self.post(1, community_id=99)]:
+            with self.subTest(row=bad['id']):
+                self.pages = {1: [self.post(1), bad]}
+                with self.assertRaises(CampusError) as caught:
+                    await self.client.fetch_window(self.start, self.end)
+                self.assertEqual(caught.exception.code, 'community_mismatch')
+
+    async def test_malformed_feed_or_row_is_not_empty_success(self):
+        for rows in [None, {}, [None], [{'id': 'invalid'}]]:
+            with self.subTest(rows=rows):
+                self.pages = {1: rows}
+                with self.assertRaises(CampusError) as caught:
+                    await self.client.fetch_window(self.start, self.end)
+                self.assertEqual(caught.exception.code, 'invalid_response')
+
+    async def test_sanitized_digest_views_have_2000_character_cap_without_private_fields(self):
+        self.pages = {1: [self.post(1, detail='<p>联系13800138000，QQ：123456789，微信：test_123，'
+                                   '邮箱a@example.com https://example.com/private</p>\n'
+                                   '<script>attack()</script>' + '字' * 2100,
+                                   uid=123, nickname='private_author', phone='13800138000',
+                                   category_name='讨论', show_images=['a', 'b']),
+                          self.post(2, detail='字' * 2000)]}
+        self.total = 2
+        out = await self.client.fetch_window(self.start, self.end)
+        post = out['posts'][0]
+        self.assertEqual(set(post), {'id', 'text', 'truncated', 'published_at',
+                                     'category', 'image_count', 'source'})
+        self.assertEqual(len(post['text']), 2000)
+        self.assertTrue(post['truncated'])
+        self.assertFalse(out['posts'][1]['truncated'])
+        self.assertEqual(post['image_count'], 2)
+        self.assertEqual(post['published_at'], '2020-01-02 10:00:00')
+        encoded = json.dumps(out, ensure_ascii=False)
+        for secret in ['13800138000', '123456789', 'test_123', 'a@example.com',
+                       'https://', 'attack()', 'private_author', '<p>']:
+            self.assertNotIn(secret, encoded)
+        query = await self.client.query('latest')
+        self.assertEqual(len(query['posts'][0]['text']), 600)
+        self.assertTrue(query['posts'][0]['truncated'])
+
+    async def test_fetch_waits_for_existing_client_lock(self):
+        await self.client.lock.acquire()
+        task = asyncio.create_task(self.client.fetch_window(self.start, self.end))
+        try:
+            await asyncio.sleep(0)
+            self.assertFalse(task.done())
+            self.assertFalse(self.calls)
+        finally:
+            self.client.lock.release()
+            await task
+        self.assertEqual(self.scope_reads, 2)
+
+    async def test_invalid_ranges_and_unbounded_pagination_never_request(self):
+        invalid = [
+            (None, self.end, {}), (self.start, None, {}), ('2020-01-02', self.end, {}),
+            (self.start.date(), self.end, {}), (self.start.replace(tzinfo=None), self.end, {}),
+            (self.start, self.end.replace(tzinfo=None), {}),
+            (self.end, self.start, {}), (self.start, self.start, {}),
+        ]
+        for name, values in [('max_pages', [None, 0, -1, 11, 1.5, '2', True, float('inf')]),
+                             ('page_size', [None, 0, -1, 21, 1.5, '2', True, float('inf')])]:
+            invalid.extend((self.start, self.end, {name: value}) for value in values)
+        for start, end, kwargs in invalid:
+            with self.subTest(start=start, end=end, kwargs=kwargs):
+                with self.assertRaises(CampusError) as caught:
+                    await self.client.fetch_window(start, end, **kwargs)
+                self.assertEqual(caught.exception.code, 'invalid_argument')
+        self.assertFalse(self.calls)
 
 
 if __name__ == '__main__':

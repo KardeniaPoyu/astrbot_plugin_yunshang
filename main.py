@@ -1,15 +1,28 @@
 import asyncio
 import copy
 import json
+import re
+import time
+import uuid
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, register
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.event.filter import PermissionType
+from astrbot.api.message_components import Image
+from astrbot.api.star import Context, Star, StarTools, register
 
 from .client import CampusClient, CampusError
+from .cards import render_digest
+from .delivery import DeliveryStore
+from .digest import SYSTEM_PROMPT, build_prompt, build_digest, digest_as_text
+from .push_service import PushService
+
+CHINA_TZ = timezone(timedelta(hours=8))
 
 
-@register('astrbot_plugin_yunshang', 'KardeniaPoyu', '查询云上校友圈的民大校园墙帖子', '0.1.0')
+@register('astrbot_plugin_yunshang', 'KardeniaPoyu', '云上校友圈查询与定时新帖卡片', '0.2.0')
 class YunshangPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -19,15 +32,170 @@ class YunshangPlugin(Star):
             community=config.get('community', '民大校园墙'),
             community_id=config.get('community_id', ''), cache_ttl=config.get('cache_seconds', 60),
         )
+        self._stop = asyncio.Event()
+        self._task = None
+        self._store = None
+        self._service = None
+        self._render_lock = asyncio.Lock()
+        self._last_cleanup = 0.0
 
     async def initialize(self):
         logger.info('[云上校友圈] 已加载；%s', '已配置登录态，首次查询时校验' if self.client.ready else '尚缺登录态，查询工具暂不提供给模型')
+        if self._enabled() and self._cfg_bool('push_enable', False) and self._targets() and self.client.ready:
+            directory = self._data_dir()
+            self._store = DeliveryStore(directory / 'delivery.sqlite3')
+            hours = self._hours()
+            self._store.bootstrap(datetime.now(CHINA_TZ), hours)
+            self._service = PushService(self._store, self._targets(), self._prepare_digest, self._send_payload, interval_hours=hours)
+            self._task = asyncio.create_task(self._push_loop(), name='yunshang-scheduled-cards')
+            logger.info('[云上校友圈] 定时卡片已启动：北京时间每%s小时，%s个目标；首次启用不补历史', hours, len(self._targets()))
 
     async def terminate(self):
+        self._stop.set()
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        if self._store:
+            self._store.close()
         await self.client.close()
 
     def _enabled(self):
-        return bool(self.config.get('enable', True))
+        return self._cfg_bool('enable', True)
+
+    def _cfg_bool(self, name, default):
+        value = self.config.get(name, default)
+        return value.strip().lower() in ('true', '1', 'yes', 'on') if isinstance(value, str) else bool(value)
+
+    def _hours(self):
+        try:
+            value = int(self.config.get('push_interval_hours', 4))
+            return value if 1 <= value <= 24 and 24 % value == 0 else 4
+        except (ValueError, TypeError):
+            return 4
+
+    def _targets(self):
+        raw = self.config.get('push_targets', [])
+        if not isinstance(raw, list):
+            return []
+        return list(dict.fromkeys(item.strip() for item in raw if isinstance(item, str)
+                                 and re.fullmatch(r'[^:\s]+:GroupMessage:[^:\s]+', item.strip())))
+
+    def _data_dir(self):
+        directory = Path(StarTools.get_data_dir('astrbot_plugin_yunshang'))
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        return directory
+
+    async def _push_loop(self):
+        while not self._stop.is_set():
+            try:
+                if self._enabled() and self._cfg_bool('push_enable', False):
+                    stats = await self._service.tick(datetime.now(CHINA_TZ), allow_prepare=self.client.ready)
+                    if stats['prepared'] or stats['sent'] or stats['failed']:
+                        logger.info('[云上校友圈] 卡片调度：准备=%s，发送=%s，失败=%s', stats['prepared'], stats['sent'], stats['failed'])
+                if time.monotonic() - self._last_cleanup > 3600:
+                    self._cleanup_cards()
+                    self._last_cleanup = time.monotonic()
+            except Exception as exc:
+                logger.warning('[云上校友圈] 调度异常类型：%s', type(exc).__name__)
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=30)
+            except asyncio.TimeoutError:
+                pass
+
+    def _cleanup_cards(self):
+        root = self._data_dir() / 'cards'
+        if not root.exists():
+            return
+        for directory in root.iterdir():
+            if not directory.is_dir() or directory.is_symlink() or not directory.name.startswith(('batch-', 'preview-')):
+                continue
+            ttl = 3600 if directory.name.startswith('preview-') else 7 * 86400
+            if time.time() - directory.stat().st_mtime < ttl:
+                continue
+            for file in directory.glob('*.png'):
+                file.unlink(missing_ok=True)
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+
+    async def _prepare_digest(self, start, end, *, preview=False):
+        # A background batch must not hold the interactive client's query lock.
+        collector = CampusClient(self.config.get('cookie', ''), school=self.client.school,
+                                 community=self.client.community, community_id=self.client.community_id)
+        try:
+            collection = await asyncio.wait_for(collector.fetch_window(start, end), timeout=70)
+        except CampusError as exc:
+            if exc.code == 'login_expired':
+                self.client.expired = True
+            raise
+        finally:
+            await collector.close()
+        if not collection['posts'] and (collection.get('scan_limited') or collection.get('invalid_dates')):
+            raise CampusError('incomplete_window', '本次时间范围未能完整确认，不能判断没有新帖')
+        reply = None
+        if collection['posts'] and self._cfg_bool('push_ai_enable', True):
+            try:
+                provider_id = str(self.config.get('push_provider_id', '')).strip()
+                provider = self.context.get_provider_by_id(provider_id) if provider_id else self.context.get_using_provider()
+                if provider:
+                    result = await asyncio.wait_for(provider.text_chat(prompt=build_prompt(collection['posts']), system_prompt=SYSTEM_PROMPT), timeout=45)
+                    reply = getattr(result, 'completion_text', None)
+            except Exception as exc:
+                logger.warning('[云上校友圈] AI摘要不可用，采用原文摘录：%s', type(exc).__name__)
+        digest = build_digest(collection, start, end, community=self.client.community, ai_reply=reply)
+        if not digest['items']:
+            return digest, []
+        name = 'preview-' + uuid.uuid4().hex if preview else 'batch-' + end.strftime('%Y%m%dT%H%M%S')
+        output_dir = self._data_dir() / 'cards' / name
+        try:
+            async with self._render_lock:
+                paths = await asyncio.to_thread(render_digest, digest, output_dir, str(self.config.get('push_font_path', '')).strip())
+            return digest, [{'kind': 'image', 'path': str(path), 'text': digest_as_text(digest, page=i)} for i, path in enumerate(paths)]
+        except Exception as exc:
+            logger.warning('[云上校友圈] 卡片渲染失败，采用文字：%s', type(exc).__name__)
+            return digest, [{'kind': 'text', 'text': digest_as_text(digest)}]
+
+    async def _send_payload(self, target, payload):
+        if payload['kind'] == 'image' and Path(payload['path']).is_file():
+            chain = MessageChain(chain=[Image.fromFileSystem(payload['path'])])
+        else:
+            chain = MessageChain().message(payload['text'])
+        return await self.context.send_message(target, chain)
+
+    @filter.command('校园圈预览')
+    @filter.permission_type(PermissionType.ADMIN)
+    async def campus_preview(self, event: AstrMessageEvent):
+        if not self._enabled():
+            yield event.plain_result('校园圈查询尚未启用')
+            return
+        end = datetime.now(CHINA_TZ)
+        try:
+            digest, pages = await asyncio.wait_for(self._prepare_digest(end - timedelta(hours=self._hours()), end, preview=True), timeout=120)
+            if not pages:
+                yield event.plain_result('该时段没有可展示的新帖')
+            for page in pages:
+                if page['kind'] == 'image':
+                    yield event.chain_result([Image.fromFileSystem(page['path'])])
+                else:
+                    yield event.plain_result(page['text'])
+        except CampusError as exc:
+            yield event.plain_result(str(exc))
+        except Exception as exc:
+            logger.warning('[云上校友圈] 卡片预览失败：%s', type(exc).__name__)
+            yield event.plain_result('校园圈预览暂时失败，请稍后重试；未改变定时发送记录')
+
+    @filter.command('校园圈推送状态')
+    @filter.permission_type(PermissionType.ADMIN)
+    async def campus_push_status(self, event: AstrMessageEvent):
+        status = self._store.status() if self._store else {}
+        yield event.plain_result(f"校园圈定时卡片：{'运行中' if self._task and not self._task.done() else '未运行'}\n"
+                                 f"北京时间每{self._hours()}小时 · {len(self._targets())}个目标\n"
+                                 f"登录态：{'已配置，查询时验证' if self.client.ready else '缺失或已失效'}\n"
+                                 + json.dumps(status, ensure_ascii=False))
 
     @filter.on_llm_request()
     async def hide_unavailable_tool(self, event: AstrMessageEvent, req):

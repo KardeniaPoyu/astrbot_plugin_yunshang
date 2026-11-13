@@ -4,5 +4,11 @@
   "school": {"description": "预期学校（必须完全匹配）", "type": "string", "default": "中央民族大学"},
   "community": {"description": "预期校园墙（必须完全匹配）", "type": "string", "default": "民大校园墙"},
   "community_id": {"description": "预期校园墙 ID（可选）", "type": "string", "default": ""},
-  "cache_seconds": {"description": "查询缓存秒数，最高300", "type": "int", "default": 60}
+  "cache_seconds": {"description": "查询缓存秒数，最高300", "type": "int", "default": 60},
+  "push_enable": {"description": "启用定时新帖卡片", "type": "bool", "default": false, "hint": "首次启用从下一个时段开始；重启仅补偿最近一个完整时段。无新帖不推送。"},
+  "push_targets": {"description": "推送目标群会话", "type": "list", "default": [], "hint": "填写AstrBot统一会话ID，例如 napcat:GroupMessage:群号。每个群独立记录发送结果。"},
+  "push_interval_hours": {"description": "推送间隔（小时）", "type": "int", "default": 4, "hint": "北京时间对齐，必须为24的约数。4表示00、04、08、12、16、20点。"},
+  "push_ai_enable": {"description": "AI提炼帖子正文", "type": "bool", "default": true, "hint": "只在准备推送或预览时调用；失败自动使用原文摘录。"},
+  "push_provider_id": {"description": "摘要模型提供商ID", "type": "string", "default": "", "hint": "留空使用当前默认聊天提供商，不修改塔菲的日常聊天模型。"},
+  "push_font_path": {"description": "中文字体路径（可选）", "type": "string", "default": "", "hint": "留空自动查找Noto CJK或系统中文字体；无法找到时回退文字。"}
 }

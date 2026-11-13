@@ -10,7 +10,7 @@ import logging
 import re
 import time
 from collections import OrderedDict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 
 import httpx
@@ -20,6 +20,7 @@ ROUTES = frozenset({
     '/base/community/lists', '/article/article/lists', '/article/article/dayhot',
     '/article/article/checkauth', '/article/article/search', '/article/article/info',
 })
+_BEIJING = timezone(timedelta(hours=8))
 
 # AstrBot may enable httpcore DEBUG traces, which include Set-Cookie headers.
 # Suppress only this client's request traces, preserving other plugin logging.
@@ -83,6 +84,24 @@ def clean_text(value):
     text = re.sub(r'((?:微信(?:号)?|微[信xX]|[vV][xX]|[wW][xX]|QQ(?:号)?|扣扣|联系方式)\s*[:：=]?\s*)[a-zA-Z0-9_+@.-]{5,}', r'\1[联系方式隐藏]', text, flags=re.I)
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
     return re.sub(r'\n{3,}', '\n\n', text).strip()
+
+
+def _published_time(value):
+    # The feed's plain timestamps are Beijing wall time. Require a full time;
+    # date-only/relative labels cannot safely be assigned to a four-hour window.
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if not re.fullmatch(r'\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}'
+                        r'(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?', value):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=_BEIJING)
+        return parsed.astimezone(timezone.utc)
+    except (ValueError, OverflowError):
+        return None
 
 
 class CampusClient:
@@ -167,14 +186,14 @@ class CampusClient:
             raise CampusError('community_mismatch', '当前登录的学校或校园墙与配置不符，已停止读取；请在小程序切回目标校园墙')
         return cid
 
-    def _post_view(self, raw, cid, *, detail=False):
+    def _post_view(self, raw, cid, *, detail=False, body_limit=None):
         if not isinstance(raw, dict) or not str(raw.get('id', '')).isdigit():
             raise CampusError('invalid_response', '帖子结构发生变化')
         row_cid = str(raw.get('community_id') or '')
         if (row_cid and row_cid != cid) or (detail and not row_cid):
             raise CampusError('community_mismatch', '帖子的校园归属无法确认，已停止读取')
         text = clean_text(raw.get('detail', ''))
-        cap = 2400 if detail else 600
+        cap = body_limit if body_limit is not None else (2400 if detail else 600)
         images = raw.get('show_images')
         if not isinstance(images, list):
             images = [s for s in str(raw.get('images') or '').split(',') if s]
@@ -185,6 +204,91 @@ class CampusClient:
             'image_count': len(images),
             'source': f'云上校友圈 → {self.community} → 帖子 {raw["id"]}',
         }
+
+    async def fetch_window(self, start: datetime, end: datetime, *, max_pages=10, page_size=20) -> dict:
+        """Collect unique posts in [start, end), newest first, without caching.
+
+        ``total`` counts collected posts; ``scanned`` counts inspected rows,
+        including duplicates. ``invalid_dates`` counts rows with missing or
+        unparseable timestamps. Such rows and future dates are excluded and
+        make ``scan_limited`` true, as does reaching the cap without coverage.
+        """
+        try:
+            if (not isinstance(start, datetime) or not isinstance(end, datetime)
+                    or start.utcoffset() is None or end.utcoffset() is None):
+                raise ValueError
+            start, end = start.astimezone(timezone.utc), end.astimezone(timezone.utc)
+            if start >= end:
+                raise ValueError
+            if (type(max_pages) is not int or not 1 <= max_pages <= 10
+                    or type(page_size) is not int or not 1 <= page_size <= 20):
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            raise CampusError('invalid_argument', '需要带时区的有效起止时间，最多扫描10页、每页20条') from None
+
+        async with self.lock:
+            cid = await self._scope()
+            now = datetime.now(timezone.utc)
+            seen = set()
+            collected = []
+            scanned = invalid_dates = 0
+            complete = uncertain = False
+            feed_total = None
+            for page in range(1, max_pages + 1):
+                data = await self._post('/article/article/lists', {'page': page, 'pageSize': page_size})
+                rows = data.get('list')
+                if not isinstance(rows, list) or len(rows) > page_size:
+                    raise CampusError('invalid_response', '校园圈响应缺少帖子列表或超出分页上限')
+                if not rows:
+                    complete = True
+                    break
+
+                total = data.get('total')
+                if isinstance(total, str):
+                    try:
+                        total = int(total)
+                    except ValueError:
+                        total = None
+                if type(total) is int and total >= 0:
+                    feed_total = max(feed_total or 0, total)
+
+                all_old = True
+                new_ids = 0
+                for raw in rows:
+                    # Validate scope even on duplicates and out-of-window rows.
+                    view = self._post_view(raw, cid, body_limit=2000)
+                    published = _published_time(raw.get('create_time'))
+                    scanned += 1
+                    is_new = view['id'] not in seen
+                    new_ids += is_new
+                    seen.add(view['id'])
+                    if published is None:
+                        invalid_dates += 1
+                        uncertain = True
+                        all_old = False
+                        continue
+                    if published > now:
+                        uncertain = True
+                        all_old = False
+                        continue
+                    if published >= start:
+                        all_old = False
+                    if is_new and start <= published < end:
+                        collected.append((published, view))
+
+                # Pinned copies consume page slots, not additional feed items.
+                # An old first page or a repeated old page is not a boundary.
+                if ((feed_total is not None and len(seen) >= feed_total)
+                        or (page >= 2 and all_old and new_ids > 0)):
+                    complete = True
+                    break
+
+            if await self._scope() != cid:
+                raise CampusError('community_mismatch', '查询过程中校园墙发生切换，请重试')
+            collected.sort(key=lambda item: item[0], reverse=True)
+            posts = [view for _, view in collected]
+            return {'posts': posts, 'total': len(posts), 'scanned': scanned,
+                    'scan_limited': uncertain or not complete, 'invalid_dates': invalid_dates}
 
     async def query(self, action='latest', *, keyword='', post_id='', limit=5):
         action = str(action).lower().strip()
