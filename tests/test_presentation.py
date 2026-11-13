@@ -1,9 +1,32 @@
 import copy
 import json
 import unittest
-from presentation import format_overview, is_campus_request, public_query_result
+from presentation import format_overview, format_detail_source, is_campus_request, public_query_result
 
 class PresentationTests(unittest.TestCase):
+    def test_detail_source_shows_only_verified_link_or_actual_miniprogram_path(self):
+        post={'id':'91','mini_app_path':'/pages/post/detail/detail?id=91'}
+        source=format_detail_source(post,'测试校园墙')
+        self.assertIn(post['mini_app_path'],source)
+        self.assertNotIn('https://',source)
+        post['post_url']='https://ys.qimiaoyuanfen.com/verified-share'
+        self.assertIn(post['post_url'],format_detail_source(post,'测试校园墙'))
+        for bad in ('https://unrelated.example/91','https://ys.qimiaoyuanfen.com@unrelated.example/91','https://ys.qimiaoyuanfen.com/91\nextra'):
+            post['post_url']=bad
+            source=format_detail_source(post,'测试校园墙')
+            self.assertNotIn(bad,source)
+            self.assertIn(post['mini_app_path'],source)
+
+    def test_detail_qr_is_an_entry_not_raw_model_data(self):
+        post={'id':'91','mini_app_path':'/pages/post/detail/detail?id=91',
+              'mini_app_qr_data_url':'data:image/jpeg;base64,private-qr'}
+        source=format_detail_source(post,'测试校园墙')
+        self.assertIn('微信扫一扫',source)
+        self.assertNotIn('private-qr',source)
+        clean=public_query_result({'posts':[post]})
+        self.assertNotIn('mini_app_qr_data_url',clean['posts'][0])
+        self.assertIn('mini_app_qr_data_url',post)
+
     def result(self):
         return {'community':'民大校园墙','cached':False,'posts':[
             {'id':str(i),'text':'同学分享图书馆使用体验。'*100,'truncated':False,
@@ -14,7 +37,7 @@ class PresentationTests(unittest.TestCase):
         self.assertLess(len(output),450)
         self.assertEqual(output.count('（节选）'),3)
         self.assertIn('\n\n2.',output)
-        self.assertIn('/校园圈 详情',output)
+        self.assertIn('/校园墙 详情',output)
 
     def test_short_post_is_not_marked_truncated(self):
         result=self.result()
@@ -84,7 +107,7 @@ class PresentationTests(unittest.TestCase):
         result = self.result()
         result['posts'][0].update(like_count=0, trace_count=None, comment_count=7,
                                   image_urls=['https://ysxy.img.qimiaoyuanfen.com/private.jpg'],
-                                  thumbnail_urls=['private-thumbnail'], image_path='private-path')
+                                  thumbnail_urls=['private-thumbnail'], image_path='private-path', image_paths=['private-gallery'])
         before = copy.deepcopy(result)
         public = public_query_result(result)
         post = public['posts'][0]

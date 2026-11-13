@@ -1,10 +1,15 @@
 import asyncio
+import base64
+import io
 import json
 import logging
+import sys
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 import httpx
+from PIL import Image
 
 from client import CampusClient, CampusError, _private_http
 
@@ -13,6 +18,19 @@ SCHOOL = {"current_community_id": 37, "current_community_name": "民大校园墙
           "current_community_school_name": "中央民族大学"}
 POST = {"id": 91, "community_id": 37, "detail": "聚雅餐厅今日讨论", "create_time": "2026-11-13 12:00:00"}
 BEIJING = timezone(timedelta(hours=8))
+QR_ROUTE = '/article/article/getxcxcode'
+
+
+def qr_data_url(size=(430, 430), *, image_format='JPEG', mime='image/jpeg', metadata=False):
+    image = Image.new('RGB', size, 'white')
+    output = io.BytesIO()
+    options = {}
+    if metadata:
+        exif = Image.Exif()
+        exif[270] = 'private metadata'
+        options['exif'] = exif
+    image.save(output, format=image_format, **options)
+    return f'data:{mime};base64,' + base64.b64encode(output.getvalue()).decode('ascii')
 
 
 class ClientTests(unittest.IsolatedAsyncioTestCase):
@@ -153,6 +171,228 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_detail_checks_scope(self):
         out = await self.client.query('detail', post_id='91')
         self.assertEqual(out['posts'][0]['id'], '91')
+
+    async def test_detail_keeps_full_sanitized_body_and_verified_mini_program_source(self):
+        self.detail.update(detail='<p>' + '原文段落。\n' * 900
+                           + '联系13800138000，邮箱a@example.com。末尾原文保留。</p><script>private()</script>',
+                           post_url='https://evil.invalid/?Cookie=secret',
+                           mini_app_path='/invented', mini_app_id='invented')
+        post = (await self.client.query('detail', post_id='91'))['posts'][0]
+        self.assertGreater(len(post['text']), 2400)
+        self.assertTrue(post['text'].endswith('末尾原文保留。'))
+        self.assertFalse(post['truncated'])
+        self.assertEqual(post['mini_app_path'], '/pages/post/detail/detail?id=91')
+        self.assertEqual(post['mini_app_id'], 'wxe23b94e06f71e89a')
+        self.assertNotIn('post_url', post)
+        encoded = json.dumps(post, ensure_ascii=False)
+        for secret in ('13800138000', 'a@example.com', 'private()', 'Cookie', 'secret', 'invented'):
+            self.assertNotIn(secret, encoded)
+
+    async def test_detail_response_byte_cap_still_applies_before_normalization(self):
+        self.responses['/article/article/info'] = httpx.Response(200, content=b'x' * 1_048_577)
+        with self.assertRaises(CampusError) as caught:
+            await self.client.query('detail', post_id='91')
+        self.assertEqual(caught.exception.code, 'invalid_response')
+        self.assertFalse(any(req.url.path.endswith('/getxcxcode') for req, _ in self.calls))
+
+    async def test_mismatched_detail_id_is_rejected_before_fetching_its_code(self):
+        self.detail['id'] = 92
+        with self.assertRaises(CampusError) as caught:
+            await self.client.query('detail', post_id='91')
+        self.assertEqual(caught.exception.code, 'invalid_response')
+        self.assertFalse(any(req.url.path.endswith('/getxcxcode') for req, _ in self.calls))
+
+    async def test_detail_source_and_full_body_keep_normal_cache_and_scope_checks(self):
+        self.detail['detail'] = '原文段落。\n' * 900
+        first = await self.client.query('detail', post_id='91')
+        post = first['posts'][0]
+        self.assertGreater(len(post['text']), 2400)
+        second = await self.client.query('detail', post_id='91')
+        self.assertTrue(second['cached'])
+        self.assertEqual(second['posts'][0], post)
+        detail_calls = [(req, body) for req, body in self.calls if req.url.path.endswith('/article/info')]
+        self.assertEqual(len(detail_calls), 1)
+        self.assertEqual(detail_calls[0][1], {'from_type': 1, 'id': '91'})
+        allowed = {'/base/community/lists', '/article/article/info', QR_ROUTE}
+        self.assertTrue(all(req.url.path in allowed for req, _ in self.calls))
+        self.assertTrue(all(not req.url.query for req, _ in self.calls))
+        self.assertNotIn('PHPSESSID', json.dumps(first))
+        post['mini_app_path'] = 'changed locally'
+        post['text'] = 'changed locally'
+        self.assertEqual((await self.client.query('detail', post_id='91'))['posts'][0]['mini_app_path'],
+                         '/pages/post/detail/detail?id=91')
+        self.assertEqual(self.calls[-1][0].url.path, '/base/community/lists')
+        self.school['current_community_school_name'] = '其他大学'
+        with self.assertRaises(CampusError) as caught:
+            await self.client.query('detail', post_id='91')
+        self.assertEqual(caught.exception.code, 'community_mismatch')
+
+    async def test_detail_qr_is_sanitized_and_cached_with_original_body(self):
+        original = qr_data_url(metadata=True)
+        self.responses[QR_ROUTE] = {'code': '0000', 'data': {'xcxCode': original}}
+        self.detail['detail'] = '原文段落。\n' * 900
+        first = await self.client.query('detail', post_id='91')
+        post = first['posts'][0]
+        value = post['mini_app_qr_data_url']
+        self.assertTrue(value.startswith('data:image/jpeg;base64,'))
+        binary = base64.b64decode(value.split(',', 1)[1], validate=True)
+        self.assertLessEqual(len(binary), 256 * 1024)
+        self.assertNotIn(b'private metadata', binary)
+        with Image.open(io.BytesIO(binary)) as image:
+            self.assertEqual((image.format, image.mode, image.size), ('JPEG', 'RGB', (430, 430)))
+            self.assertFalse(image.getexif())
+            image.load()
+        self.assertEqual(post['text'], self.detail['detail'].strip())
+        self.assertFalse(post['truncated'])
+        second = await self.client.query('detail', post_id='91')
+        self.assertTrue(second['cached'])
+        self.assertEqual(second['posts'][0]['mini_app_qr_data_url'], value)
+        post['mini_app_qr_data_url'] = 'changed locally'
+        self.assertEqual((await self.client.query('detail', post_id='91'))['posts'][0]['mini_app_qr_data_url'], value)
+        qr_calls = [(req, body) for req, body in self.calls if req.url.path == QR_ROUTE]
+        self.assertEqual(len(qr_calls), 1)
+        request, body = qr_calls[0]
+        self.assertEqual(body, {'article_id': '91'})
+        self.assertEqual(request.method, 'POST')
+        self.assertEqual(str(request.url), 'https://ys.qimiaoyuanfen.com' + QR_ROUTE)
+        self.assertEqual(request.headers['cookie'], 'PHPSESSID=example')
+        self.assertNotIn('authorization', request.headers)
+        self.assertNotIn('PHPSESSID', json.dumps(first))
+        self.assertEqual([req.url.path for req, _ in self.calls[:4]],
+                         ['/base/community/lists', '/article/article/info', QR_ROUTE, '/base/community/lists'])
+
+    async def test_qr_sniffs_png_and_jpeg_bytes_despite_mislabeled_image_header(self):
+        for image_format in ('JPEG', 'PNG'):
+            for mime in ('image/jpeg', 'image/jpg', 'image/png'):
+                with self.subTest(image_format=image_format, mime=mime):
+                    self.client.cache.clear()
+                    original = qr_data_url(image_format=image_format, mime=mime, metadata=True)
+                    self.responses[QR_ROUTE] = {'code': '0000', 'data': {'xcxCode': original}}
+                    post = (await self.client.query('detail', post_id='91'))['posts'][0]
+                    value = post['mini_app_qr_data_url']
+                    self.assertTrue(value.startswith('data:image/jpeg;base64,'))
+                    binary = base64.b64decode(value.split(',', 1)[1], validate=True)
+                    self.assertLessEqual(len(binary), 256 * 1024)
+                    with Image.open(io.BytesIO(binary)) as image:
+                        self.assertEqual((image.format, image.mode, image.size), ('JPEG', 'RGB', (430, 430)))
+                        self.assertFalse(image.getexif())
+                        image.load()
+
+    async def test_qr_transparent_png_uses_white_background(self):
+        with Image.new('RGBA', (80, 80), (0, 0, 0, 0)) as image:
+            image.paste((0, 0, 0, 255), (20, 20, 60, 60))
+            output = io.BytesIO()
+            image.save(output, format='PNG')
+        original = 'data:image/png;base64,' + base64.b64encode(output.getvalue()).decode('ascii')
+        self.responses[QR_ROUTE] = {'code': '0000', 'data': {'xcxCode': original}}
+        post = (await self.client.query('detail', post_id='91'))['posts'][0]
+        binary = base64.b64decode(post['mini_app_qr_data_url'].split(',', 1)[1])
+        with Image.open(io.BytesIO(binary)) as image:
+            self.assertEqual(image.getpixel((0, 0)), (255, 255, 255))
+            self.assertEqual(image.getpixel((40, 40)), (0, 0, 0))
+
+    async def test_qr_rejects_remote_urls_spoofed_images_and_size_bombs(self):
+        valid = qr_data_url()
+        invalid = [None, {}, '', 'https://evil.invalid/qr?Cookie=private',
+                   '//evil.invalid/qr', 'data:image/gif;base64,' + valid.split(',', 1)[1],
+                   'data:image/jpeg;base64,not base64!',
+                   'data:image/jpeg;base64,' + base64.b64encode(b'not an image').decode(),
+                   'data:image/png;base64,' + base64.b64encode(b'<svg>not a PNG</svg>').decode(),
+                   qr_data_url(image_format='GIF'), qr_data_url(size=(1001, 1000)),
+                   qr_data_url(size=(1001, 1000), image_format='PNG', mime='image/png'),
+                   'data:image/jpeg;base64,' + base64.b64encode(b'x' * (256 * 1024 + 1)).decode(),
+                   valid[:-40]]
+        for value in invalid:
+            with self.subTest(kind=str(type(value)), length=len(value) if isinstance(value, str) else 0):
+                self.client.cache.clear()
+                self.calls.clear()
+                self.responses[QR_ROUTE] = {'code': '0000', 'data': {'xcxCode': value}}
+                post = (await self.client.query('detail', post_id='91'))['posts'][0]
+                self.assertNotIn('mini_app_qr_data_url', post)
+                self.assertEqual(post['text'], POST['detail'])
+                self.assertEqual(sum(req.url.path == QR_ROUTE for req, _ in self.calls), 1)
+                self.assertTrue(all(req.url.host == 'ys.qimiaoyuanfen.com' and not req.url.query
+                                    for req, _ in self.calls))
+                self.assertEqual(self.calls[-1][0].url.path, '/base/community/lists')
+
+    async def test_qr_failure_is_optional_including_endpoint_auth_denial(self):
+        failures = [httpx.Response(302, headers={'location': 'https://evil.invalid/?Cookie=private'}),
+                    httpx.Response(401), httpx.Response(403), httpx.Response(503),
+                    httpx.Response(200, content=b'private invalid json'),
+                    httpx.Response(200, content=b'x' * 1_048_577),
+                    {'code': '7001', 'message': 'private upstream message', 'data': []},
+                    {'code': '5000', 'data': {}}, {'code': '0000', 'data': []},
+                    {'code': '0000', 'data': {}}]
+        for response in failures:
+            with self.subTest(response_type=type(response).__name__):
+                self.client.cache.clear()
+                self.calls.clear()
+                self.responses[QR_ROUTE] = response
+                post = (await self.client.query('detail', post_id='91'))['posts'][0]
+                self.assertEqual(post['text'], POST['detail'])
+                self.assertNotIn('mini_app_qr_data_url', post)
+                self.assertTrue(self.client.ready)
+                self.assertEqual([req.url.path for req, _ in self.calls],
+                                 ['/base/community/lists', '/article/article/info', QR_ROUTE, '/base/community/lists'])
+                self.assertNotIn('private', json.dumps(post))
+                self.assertFalse(_private_http.get())
+
+    async def test_qr_timeout_does_not_drop_body_or_skip_final_scope(self):
+        original_handler = self.client.http._transport.handler
+
+        def handler(request):
+            if request.url.path == QR_ROUTE:
+                self.calls.append((request, json.loads(request.content)))
+                raise httpx.ReadTimeout('Cookie=private')
+            return original_handler(request)
+
+        self.client.http._transport = httpx.MockTransport(handler)
+        post = (await self.client.query('detail', post_id='91'))['posts'][0]
+        self.assertEqual(post['text'], POST['detail'])
+        self.assertNotIn('mini_app_qr_data_url', post)
+        self.assertEqual(sum(req.url.path == QR_ROUTE for req, _ in self.calls), 1)
+        self.assertEqual(self.calls[-1][0].url.path, '/base/community/lists')
+
+    async def test_qr_failure_does_not_mask_final_login_or_scope_failure(self):
+        original_handler = self.client.http._transport.handler
+        for failure in ('community_mismatch', 'login_expired'):
+            with self.subTest(failure=failure):
+                self.calls.clear()
+                self.client.cache.clear()
+                self.client.expired = False
+
+                def handler(request):
+                    if request.url.path == '/base/community/lists' and self.calls:
+                        self.calls.append((request, json.loads(request.content)))
+                        data = dict(SCHOOL, current_community_id=38)
+                        return httpx.Response(200, json={'code': '7001' if failure == 'login_expired' else '0000',
+                                                         'data': data})
+                    return original_handler(request)
+
+                self.responses[QR_ROUTE] = httpx.Response(503)
+                self.client.http._transport = httpx.MockTransport(handler)
+                with self.assertRaises(CampusError) as caught:
+                    await self.client.query('detail', post_id='91')
+                self.assertEqual(caught.exception.code, failure)
+                self.assertEqual(sum(req.url.path == QR_ROUTE for req, _ in self.calls), 1)
+                self.assertFalse(self.client.cache)
+
+    async def test_qr_is_not_requested_without_matching_detail_identity(self):
+        for fields in ({'id': 92}, {'community_id': 99}, {'community_id': None}):
+            with self.subTest(fields=fields):
+                self.detail = dict(POST, **fields)
+                self.calls.clear()
+                with self.assertRaises(CampusError):
+                    await self.client.query('detail', post_id='91')
+                self.assertFalse(any(req.url.path == QR_ROUTE for req, _ in self.calls))
+
+    async def test_qr_remains_optional_without_pillow(self):
+        self.responses[QR_ROUTE] = {'code': '0000', 'data': {'xcxCode': qr_data_url()}}
+        with patch.dict(sys.modules, {'PIL': None}):
+            post = (await self.client.query('detail', post_id='91'))['posts'][0]
+        self.assertEqual(post['text'], POST['detail'])
+        self.assertNotIn('mini_app_qr_data_url', post)
+        self.assertEqual(sum(req.url.path == QR_ROUTE for req, _ in self.calls), 1)
 
     async def test_cache_expires_and_does_not_hide_changed_circle(self):
         a = await self.client.query('latest')

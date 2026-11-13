@@ -44,16 +44,18 @@ class DigestTests(unittest.TestCase):
         c=self.collection([{**POST,'id':str(i),'text':POST['text'] + str(i)} for i in range(12)])
         c['scan_limited']=True
         d=build_digest(c,START,END)
-        self.assertEqual((d['total'],d['shown']),(12,4))
+        self.assertEqual((d['total'],d['shown']),(12,10))
         self.assertIn('不代表完整',digest_as_text(d))
-        self.assertEqual(digest_as_text(d,page=0).count('有同学想周末'),8) # title plus summary on 4 items
-        self.assertNotIn('有同学想周末',digest_as_text(d,page=1))
+        self.assertEqual(digest_as_text(d).count('有同学想周末'),10)
+        self.assertEqual(digest_as_text(d,page=0).count('有同学想周末'),4)
+        self.assertEqual(digest_as_text(d,page=1).count('有同学想周末'),4)
 
     def test_prompt_has_bounded_sources_and_text(self):
         p=build_prompt([{**POST,'id':str(i),'text':'字'*3000 + str(i)} for i in range(200)])
         rows=json.loads(p)['posts']
-        self.assertEqual(len(rows),4)
-        self.assertEqual(sum(len(x['text']) for x in rows),4800)
+        self.assertEqual(len(rows),10)
+        self.assertEqual(sum(len(x['text']) for x in rows),12000)
+        self.assertLessEqual(sum(len(x['text']) for x in rows),16000)
 
     def test_empty_and_nonobject_reply_fall_back_safely(self):
         for response in ('[]','null','{"items":null}','{"items":[null]}'):
@@ -65,7 +67,7 @@ class DigestTests(unittest.TestCase):
         rows = json.loads(build_prompt(posts))['posts']
         self.assertEqual(len(rows[0]['text']), 1200)
         self.assertTrue(rows[0]['truncated'])
-        self.assertEqual(len(rows), 4)
+        self.assertEqual(len(rows), 10)
         self.assertEqual(len(rows[-1]['text']), 1200)
         self.assertTrue(rows[-1]['truncated'])
         self.assertFalse(posts[0]['truncated'])
@@ -77,14 +79,17 @@ class DigestTests(unittest.TestCase):
                  for i in range(40)]
         before = copy.deepcopy(posts)
         rows = json.loads(build_prompt(posts))['posts']
-        self.assertEqual([row['id'] for row in rows], ['39', '38', '37', '36'])
-        self.assertEqual([row['like_count'] for row in rows], [39, 38, 37, 36])
+        self.assertEqual([row['id'] for row in rows], [str(i) for i in range(39, 29, -1)])
+        self.assertEqual([row['like_count'] for row in rows], list(range(39, 29, -1)))
         self.assertTrue(all(row['trace_count'] == row['comment_count'] == 0 for row in rows))
         self.assertTrue(all(len(row['text']) == 1200 and row['truncated'] for row in rows))
-        for limit in (4, 8, 999):
+        self.assertEqual(len(candidates(posts)), 10)
+        self.assertEqual(len(build_digest(self.collection(posts), START, END)['items']), 10)
+        for limit, shown in ((None, 10), (4, 4), (8, 8), (10, 10), (999, 10), (0, 0)):
+            self.assertEqual(len(candidates(posts, limit=limit)), shown)
             digest = build_digest(self.collection(posts), START, END, max_items=limit)
-            self.assertEqual([row['id'] for row in digest['items']], ['39', '38', '37', '36'])
-            self.assertEqual((digest['ranking'], digest['shown'], digest['total']), ('likes', 4, 40))
+            self.assertEqual([row['id'] for row in digest['items']], [str(i) for i in range(39, 39 - shown, -1)])
+            self.assertEqual((digest['ranking'], digest['shown'], digest['total']), ('likes', shown, 40))
         self.assertEqual(posts, before)
 
     def test_rank_priority_likes_traces_comments_then_actual_instant(self):
@@ -101,7 +106,7 @@ class DigestTests(unittest.TestCase):
              'trace_count': 3, 'comment_count': 2, 'published_at': '2026-11-12T10:30:00+08:00'},
         ]
         digest = build_digest(self.collection(posts), START, END)
-        self.assertEqual([row['id'] for row in digest['items']], ['likes', 'traces', 'comments', 'newest'])
+        self.assertEqual([row['id'] for row in digest['items']], ['likes', 'traces', 'comments', 'newest', 'old'])
 
     def test_known_zero_precedes_unknown_and_full_ties_preserve_source_order(self):
         posts = [
@@ -115,7 +120,7 @@ class DigestTests(unittest.TestCase):
              'trace_count': 0, 'comment_count': 0, 'published_at': '2026-11-12T02:20:00Z'},
         ]
         self.assertEqual([row['id'] for row in candidates(posts)],
-                         ['tie-first', 'tie-second', 'comment-unknown', 'trace-unknown'])
+                         ['tie-first', 'tie-second', 'comment-unknown', 'trace-unknown', 'unknown'])
         self.assertEqual([row['id'] for row in candidates(posts[:2])], ['trace-unknown', 'unknown'])
 
     def test_invalid_timestamp_ranks_last_without_reordering_equal_unknown_dates(self):
@@ -144,7 +149,7 @@ class DigestTests(unittest.TestCase):
 
     def test_deduplication_uses_full_exact_text_before_truncation(self):
         posts = [{**POST, 'id': str(i), 'text': '字' * 1500 + str(i)} for i in range(5)]
-        self.assertEqual([row['id'] for row in candidates(posts)], ['0', '1', '2', '3'])
+        self.assertEqual([row['id'] for row in candidates(posts)], ['0', '1', '2', '3', '4'])
 
     def test_selected_snapshots_do_not_alias_source_and_prompt_keeps_urls_internal(self):
         posts = [{**POST, 'like_count': 12, 'trace_count': 3, 'comment_count': 4,
@@ -168,7 +173,7 @@ class DigestTests(unittest.TestCase):
         reply = {'items': [{'id': str(i), 'title': '图书馆搭子',
                             'summary': f'同学{i}询问图书馆结伴。', 'like_count': 999}
                            for i in range(6)]}
-        digest = build_digest(self.collection(posts), START, END, ai_reply=json.dumps(reply))
+        digest = build_digest(self.collection(posts), START, END, ai_reply=json.dumps(reply), max_items=4)
         self.assertEqual([row['id'] for row in digest['items']], ['5', '4', '3', '2'])
         self.assertEqual([row['like_count'] for row in digest['items']], [5, 4, 3, 2])
         self.assertEqual(digest['mode'], 'ai')
@@ -183,7 +188,7 @@ class DigestTests(unittest.TestCase):
             {'id': '4', 'title': '官方通知', 'summary': '领取500元。'},
             {'id': '3', 'title': None, 'summary': '不合法'},
         ]}
-        digest = build_digest(self.collection(posts), START, END, ai_reply=json.dumps(reply))
+        digest = build_digest(self.collection(posts), START, END, ai_reply=json.dumps(reply), max_items=4)
         self.assertEqual([row['id'] for row in digest['items']], ['5', '4', '3', '2'])
         self.assertEqual([row['summary'] for row in digest['items'][:3]],
                          [posts[5]['text'], posts[4]['text'], posts[3]['text']])
@@ -203,10 +208,156 @@ class DigestTests(unittest.TestCase):
         self.assertIn('蹲蹲3', output)
         self.assertNotIn('赞None', output)
         self.assertNotIn('蹲蹲None', output)
-        unknown = next(block for block in output.split('\n\n') if block.startswith('#unknown '))
+        unknown = next(block for block in output.split('\n\n') if block.startswith('#unknown\n'))
         self.assertNotIn('赞', unknown)
         self.assertNotIn('蹲蹲', unknown)
         self.assertNotIn('qimiaoyuanfen', output)
+
+    def test_full_sanitized_body_survives_prompt_truncation_and_snapshot_edits(self):
+        text = '开头段落。\n\n' + '字' * 1300 + '\n联系13800138000，邮箱a@example.com。尾段保留。'
+        posts = [{**POST, 'text': text, 'image_urls': ['https://ysxy.img.qimiaoyuanfen.com/a.jpg']}]
+        before = copy.deepcopy(posts)
+        selected = candidates(posts)
+        item = build_digest(self.collection(posts), START, END)['items'][0]
+        prompt_row = json.loads(build_prompt(posts))['posts'][0]
+        self.assertGreater(len(selected[0]['text']), 1200)
+        self.assertEqual(item['body'], selected[0]['text'])
+        self.assertTrue(item['body'].endswith('尾段保留。'))
+        self.assertIn('\n\n', item['body'])
+        self.assertNotIn('13800138000', item['body'])
+        self.assertNotIn('a@example.com', item['body'])
+        self.assertFalse(item['truncated'])
+        self.assertTrue(prompt_row['truncated'])
+        self.assertEqual(len(prompt_row['text']), 1200)
+        selected[0]['image_urls'].clear()
+        item['image_urls'].append('independent')
+        self.assertEqual(posts, before)
+
+    def test_body_cap_and_original_truncation_are_independent_of_ai_budget(self):
+        posts = [{**POST, 'id': 'whole', 'text': '甲' * 2000},
+                 {**POST, 'id': 'upstream', 'text': '乙' * 1500, 'truncated': True},
+                 {**POST, 'id': 'capped', 'text': '丙' * 2400},
+                 {**POST, 'id': 'photo', 'text': '', 'image_count': 2}]
+        digest = build_digest(self.collection(posts), START, END)
+        self.assertEqual([len(row['body']) for row in digest['items']], [2000, 1500, 2000, 0])
+        self.assertEqual([row['truncated'] for row in digest['items']], [False, True, True, False])
+        self.assertEqual(digest['items'][0]['body'], '甲' * 2000)
+        self.assertTrue(all('text' not in row for row in digest['items']))
+
+    def test_default_digest_keeps_all_ten_bodies_despite_partial_reordered_ai(self):
+        posts = [{**POST, 'id': str(i), 'text': f'同学{i}想找图书馆搭子。', 'like_count': i}
+                 for i in range(30)]
+        reply = {'items': [{'id': '25', 'title': '图书馆结伴', 'summary': '同学25询问图书馆结伴。',
+                            'body': '丢弃原文', 'like_count': 999},
+                           {'id': '29', 'title': '官方通知', 'summary': '领取500元。'},
+                           {'id': 'unknown', 'title': '未知帖子', 'summary': '未知帖子'}]}
+        digest = build_digest(self.collection(posts), START, END, ai_reply=json.dumps(reply))
+        self.assertEqual([row['id'] for row in digest['items']], [str(i) for i in range(29, 19, -1)])
+        self.assertEqual([row['body'] for row in digest['items']], [row['text'] for row in reversed(posts[20:])])
+        self.assertEqual(digest['shown'], 10)
+        self.assertEqual(digest['items'][0]['summary'], posts[29]['text'])
+        self.assertEqual(digest['items'][4]['summary'], '同学25询问图书馆结伴。')
+        self.assertEqual(digest['items'][4]['like_count'], 25)
+        self.assertEqual(digest['items'][-1]['summary'], posts[20]['text'])
+
+    def test_short_prompt_and_ai_are_limited_to_ten_selected_sources(self):
+        posts = [{**POST, 'id': str(i), 'text': f'同学{i}想找图书馆搭子。'} for i in range(30)]
+        rows = json.loads(build_prompt(posts))['posts']
+        self.assertEqual([row['id'] for row in rows], [str(i) for i in range(10)])
+        reply = {'items': [{'id': str(i), 'title': '图书馆搭子', 'summary': f'同学{i}询问图书馆结伴。'}
+                           for i in range(10)]}
+        digest = build_digest(self.collection(posts), START, END, ai_reply=json.dumps(reply))
+        self.assertEqual(len(digest['items']), 10)
+        self.assertEqual(digest['items'][9]['summary'], '同学9询问图书馆结伴。')
+        unseen = {'items': [{'id': '10', 'title': '图书馆搭子', 'summary': '同学10询问图书馆结伴。'}]}
+        rejected = build_digest(self.collection(posts), START, END, ai_reply=json.dumps(unseen))
+        self.assertEqual(rejected['mode'], 'excerpt')
+        self.assertEqual([row['id'] for row in rejected['items']], [str(i) for i in range(10)])
+        self.assertEqual(rejected['items'][9]['body'], posts[9]['text'])
+
+    def test_facts_beyond_per_post_prompt_cutoff_do_not_ground_ai(self):
+        post = {**POST, 'text': '字' * 1200 + '报名费500元。'}
+        reply = {'items': [{'id': '42', 'title': '报名信息', 'summary': '报名费500元。'}]}
+        digest = build_digest(self.collection([post]), START, END, ai_reply=json.dumps(reply))
+        self.assertEqual(digest['mode'], 'excerpt')
+        self.assertEqual(digest['items'][0]['body'], post['text'])
+        self.assertTrue(digest['items'][0]['body'].endswith('报名费500元。'))
+        self.assertNotIn('500', json.loads(build_prompt([post]))['posts'][0]['text'])
+
+    def test_text_subset_excerpts_source_body_without_duplicate_title_or_other_posts(self):
+        posts = [{**POST, 'id': str(i), 'text': f'原文{i}。\n' + '字' * 1300 + f'尾段{i}。',
+                  'like_count': 3, 'trace_count': 2, 'image_count': 4} for i in range(5)]
+        digest = build_digest(self.collection(posts), START, END)
+        before = copy.deepcopy(digest)
+        subset = [digest['items'][1], digest['items'][3]]
+        output = digest_as_text(digest, items=subset)
+        for i in (1, 3):
+            self.assertIn(posts[i]['text'][:180], output)
+            self.assertNotIn(f'尾段{i}', output)
+            self.assertEqual(output.count(f'原文{i}'), 1)
+        for i in (0, 2, 4):
+            self.assertNotIn(f'尾段{i}', output)
+        self.assertEqual(output.count('赞3 · 蹲蹲2'), 2)
+        self.assertEqual(output.count('配图4张'), 2)
+        self.assertEqual(output.count('（节选）'), 2)
+        self.assertEqual(digest_as_text(digest, page=0, items=subset), output)
+        self.assertNotIn('尾段', digest_as_text(digest, items=[]))
+        self.assertEqual(digest, before)
+
+    def test_single_fallback_message_keeps_ten_bounded_excerpts_and_full_stored_bodies(self):
+        posts = [{**POST, 'id': str(1000000000000000000 + i),
+                  'text': f'帖子{i}。' + '字' * 1900 + f'尾段{i}。',
+                  'like_count': 123456789, 'trace_count': 987654321, 'image_count': 9,
+                  'published_at': '2026-11-12T10:20:00+08:00'} for i in range(10)]
+        digest = build_digest(self.collection(posts), START, END)
+        for item in digest['items']:
+            item['title'] = '独立标题' + '题' * 28
+        digest['scan_limited'] = True
+        before = copy.deepcopy(digest)
+        output = digest_as_text(digest)
+        self.assertLessEqual(len(output), 3500)
+        self.assertEqual(output.count('（节选）'), 10)
+        for i, post in enumerate(posts):
+            self.assertEqual(output.count(f"#{post['id']}"), 1)
+            self.assertIn(post['text'][:180], output)
+            self.assertNotIn(f'尾段{i}', output)
+            self.assertEqual(digest['items'][i]['body'], post['text'])
+        self.assertIn('收集10条 · 展示10条', output)
+        self.assertIn('/校园墙 详情 帖子ID', output)
+        self.assertEqual(digest, before)
+
+    def test_short_body_is_not_duplicated_or_falsely_marked_as_excerpt(self):
+        posts = [{**POST, 'text': '找同学一起自习。'},
+                 {**POST, 'id': 'upstream', 'text': '上游已截取', 'truncated': True},
+                 {**POST, 'id': 'photo', 'text': '', 'image_count': 3}]
+        digest = build_digest(self.collection(posts), START, END)
+        output = digest_as_text(digest)
+        self.assertEqual(output.count('找同学一起自习'), 1)
+        self.assertEqual(output.count('（节选）'), 1)
+        self.assertIn('这条投稿以配图为主。', output)
+        self.assertIn('配图3张', output)
+
+    def test_single_message_budget_includes_metadata_without_dropping_any_post(self):
+        posts = [{**POST, 'id': '1' * 63 + str(i), 'text': f'原文{i}。' + '字' * 1900,
+                  'published_at': '2026-11-12 10:20:00' + '来源时间说明' * 10,
+                  'like_count': 123456789012345678901234, 'trace_count': 987654321098765432109876,
+                  'image_count': 9} for i in range(10)]
+        digest = build_digest(self.collection(posts), START, END, community='民大校园墙' * 40)
+        digest.update(scan_limited=True, omitted=123456789)
+        for item in digest['items']:
+            item['title'] = '独立标题' + '题' * 28
+        before = copy.deepcopy(digest)
+        output = digest_as_text(digest)
+        self.assertLessEqual(len(output), 3500)
+        self.assertEqual(output.count('（节选）'), 10)
+        for post in posts:
+            self.assertEqual(output.count(f"#{post['id']}"), 1)
+            self.assertIn(post['text'][:100], output)
+        self.assertEqual(output.count('赞123456789012345678901234'), 10)
+        self.assertEqual(output.count('蹲蹲987654321098765432109876'), 10)
+        self.assertIn('展示10条', output)
+        self.assertIn('/校园墙 详情 帖子ID', output)
+        self.assertEqual(digest, before)
 
     def test_prompt_preserves_existing_truncation_and_complete_boundary(self):
         rows = json.loads(build_prompt([

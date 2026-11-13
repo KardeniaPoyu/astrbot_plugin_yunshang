@@ -1,6 +1,7 @@
 """Chat presentation; independent of the scheduled digest pipeline."""
 import re
 import copy
+from urllib.parse import urlsplit
 
 CHAT_GUIDANCE = '''
 
@@ -41,14 +42,38 @@ def format_overview(result):
         if counts:
             note = f' · {counts}' + note
         lines.append(f"{index}. {body}\n#{post['id']} · {date}{note}")
-    lines.append('看原文：/校园圈 详情 帖子ID')
+    lines.append('看原文：/校园墙 详情 帖子ID')
     return '\n\n'.join(lines)
 
 
 def public_query_result(result):
     """The model gets source text and IDs, not long CDN links or local paths."""
     result = copy.deepcopy(result)
+    result.pop('full_text_file', None)
     for post in result.get('posts', []):
-        for key in ('image_urls', 'thumbnail_urls', 'image_path'):
+        for key in ('image_urls', 'thumbnail_urls', 'image_path', 'image_paths', 'mini_app_qr_data_url'):
             post.pop(key, None)
     return result
+
+
+def format_detail_source(post, community):
+    """Show verified public sharing URLs or the exact mini-program location."""
+    pid = str(post['id'])
+    lines = [f"原帖：云上校友圈 · {community} · #{pid}"]
+    url = str(post.get('post_url') or '')
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        parsed = urlsplit('')
+    if (parsed.scheme == 'https' and parsed.hostname in
+            {'ys.qimiaoyuanfen.com', 'wxaurl.cn', 'wxmpurl.cn'}
+            and not parsed.username and not parsed.password and not re.search(r'\s', url)):
+        lines.append('帖子链接：' + url)
+    elif post.get('mini_app_qr_data_url'):
+        lines.append('微信扫一扫卡片底部的小程序码，打开该原帖')
+    else:
+        path = str(post.get('mini_app_path') or '')
+        if path.lstrip('/') == 'pages/post/detail/detail?id=' + pid:
+            lines.append('小程序原帖路径：' + path)
+        lines.append('原帖需在微信「云上校友圈」内打开')
+    return '\n'.join(lines)

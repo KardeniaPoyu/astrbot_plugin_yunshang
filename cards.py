@@ -7,6 +7,9 @@ text fallback. There is no network access or persistent state in this module.
 
 from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
+import base64
+import binascii
+from io import BytesIO
 from pathlib import Path
 import os
 import re
@@ -24,12 +27,19 @@ class RenderError(RuntimeError):
 
 
 WIDTH = 1080
-MAX_HEIGHT = 2400
+MAX_HEIGHT = 16000
 _CST = timezone(timedelta(hours=8))
-_SCALE = 2  # Draw at 2x and downsample: Pillow shapes are not anti-aliased.
-_THUMB_SIZE = (232, 208)
+_SCALE = 1  # Native long canvas: FreeType still anti-aliases text, without 4x RAM.
+_BODY_LIMIT = 720
+_BODY_LINES = 21
 _THUMB_PAD = 10
-_THUMB_GAP = 24
+_GALLERY_HEIGHT = 360
+_GALLERY_GAP = 16
+_DETAIL_CHAR_LIMIT = 20_000
+_DETAIL_PAGE_LIMIT = 3
+_DETAIL_QR_EDGE = 430
+_DETAIL_QR_PAD = 16
+_DETAIL_QR_SPACE = 24 + _DETAIL_QR_EDGE + 2 * _DETAIL_QR_PAD + 16 + 26
 # Neutral text/surface tokens follow Lark (Feishu) UD; tags and alerts reuse
 # Ant Design v5 preset palettes, so the card reads like a familiar IM card.
 _BG = "#F2F3F5"
@@ -75,7 +85,7 @@ _REQUIRED = {
     "community", "window_start", "window_end", "total", "shown",
     "scan_limited", "mode", "intro", "items",
 }
-_ITEM_KEYS = {"id", "title", "summary", "published_at", "category", "image_count"}
+_ITEM_KEYS = {"id", "title", "published_at", "category", "image_count"}
 
 
 def _font_candidates():
@@ -212,46 +222,58 @@ def _wrap(text, font, width, max_lines):
     Prefer a word boundary for Latin text; split overlong tokens when necessary.
     For a pathological punctuation-only run, pixel safety takes precedence over
     punctuation rules. Work stops after max_lines + 1 rather than wrapping the
-    entire input before truncating it.
+    entire input before truncating it. Probe at most 512 characters at a time,
+    rather than repeatedly shaping the whole remaining paragraph. An offset
+    also avoids copying that remaining paragraph on every line.
     """
     if max_lines < 1 or width < font.getlength("…"):
         raise RenderError("Text region is too small")
     lines = []
     paragraphs = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     for paragraph_index, paragraph in enumerate(paragraphs):
-        rest = paragraph.strip()
-        if not rest:
+        paragraph = paragraph.strip()
+        offset, length = 0, len(paragraph)
+        if not paragraph:
             lines.append("")
-        while rest:
-            low, high = 0, len(rest)
+        while offset < length:
+            limit = min(length - offset, 512)
+            low, high = 0, min(32, limit)
+            while font.getlength(paragraph[offset:offset + high]) <= width:
+                low = high
+                if high == limit:
+                    break
+                high = min(high * 2, limit)
             while low < high:
                 middle = (low + high + 1) // 2
-                if font.getlength(rest[:middle]) <= width:
+                if font.getlength(paragraph[offset:offset + middle]) <= width:
                     low = middle
                 else:
                     high = middle - 1
             take = low
             if take == 0:
                 raise RenderError("A glyph exceeds the text region")
-            if take < len(rest):
+            if offset + take < length:
                 # Avoid breaking a short English word if there is a usable space.
-                if rest[take - 1].isascii() and rest[take].isascii():
-                    space = rest.rfind(" ", 0, take)
+                if paragraph[offset + take - 1].isascii() and paragraph[offset + take].isascii():
+                    space = paragraph.rfind(" ", offset, offset + take) - offset
                     if space >= take // 2:
                         take = space + 1
                 # Moving the preceding character with closing punctuation keeps
                 # the line width fixed and does not hang punctuation off-canvas.
                 candidate = take
                 while candidate > 0 and (
-                    rest[candidate - 1] in _OPENING or rest[candidate] in _CLOSING
+                    paragraph[offset + candidate - 1] in _OPENING
+                    or paragraph[offset + candidate] in _CLOSING
                 ):
                     candidate -= 1
                 if candidate:
                     take = candidate
-            lines.append(rest[:take].rstrip())
-            rest = rest[take:].lstrip()
+            lines.append(paragraph[offset:offset + take].rstrip())
+            offset += take
+            while offset < length and paragraph[offset].isspace():
+                offset += 1
             if len(lines) == max_lines:
-                more = rest or any(p.strip() for p in paragraphs[paragraph_index + 1:])
+                more = offset < length or any(p.strip() for p in paragraphs[paragraph_index + 1:])
                 if more:
                     lines[-1] = _ellipsis(lines[-1], font, width)
                 return lines
@@ -274,7 +296,7 @@ def _window(value):
         raise RenderError("Time windows must be timezone-aware ISO strings") from exc
 
 
-def _validate(digest):
+def _validate(digest, planned_shown=None):
     if not isinstance(digest, dict) or not _REQUIRED.issubset(digest):
         raise RenderError("Missing required digest fields")
     start, end = _window(digest["window_start"]), _window(digest["window_end"])
@@ -287,9 +309,11 @@ def _validate(digest):
     if any(type(digest[key]) is not int or digest[key] < 0 for key in ("total", "shown")):
         raise RenderError("Digest counts must be non-negative integers")
     items = digest["items"]
-    if not isinstance(items, list) or not (digest["shown"] <= len(items) and digest["shown"] <= digest["total"]):
+    shown = digest["shown"] if planned_shown is None else planned_shown
+    if (not isinstance(items, list) or type(shown) is not int
+            or not 0 <= shown <= min(len(items), digest["shown"], digest["total"])):
         raise RenderError("Digest counts do not match available items")
-    selected = items[:min(digest["shown"], 8)]
+    selected = items[:shown]
     for item in selected:
         if not isinstance(item, dict) or not _ITEM_KEYS.issubset(item):
             raise RenderError("Missing required item fields")
@@ -297,6 +321,9 @@ def _validate(digest):
             raise RenderError("Every item requires a source post ID")
         if type(item["image_count"]) is not int or item["image_count"] < 0:
             raise RenderError("image_count must be a non-negative integer")
+        if "gallery_count" in item and (type(item["gallery_count"]) is not int
+                                        or not 0 <= item["gallery_count"] <= 3):
+            raise RenderError("gallery_count must be an integer between zero and three")
         for key in ("like_count", "trace_count", "comment_count"):
             count = item.get(key)
             if count is not None and (type(count) is not int or count < 0):
@@ -322,7 +349,7 @@ def _tag_color(category):
     return _TAGS[_TAG_FALLBACK[sum(map(ord, category)) % len(_TAG_FALLBACK)]]
 
 
-def _load_thumbnail(image_path):
+def _load_thumbnail(image_path, size):
     """Read one trusted cache JPEG; failed/expired files leave a text-only item.
 
     The caller normalizes orientation and caps each edge at 2048px. Decode now
@@ -336,7 +363,7 @@ def _load_thumbnail(image_path):
             if max(source.size) > 2048:
                 return None
             with source.convert("RGB") as thumbnail:
-                bounds = tuple((edge - 2 * _THUMB_PAD) * _SCALE for edge in _THUMB_SIZE)
+                bounds = tuple((edge - 2 * _THUMB_PAD) * _SCALE for edge in size)
                 fit = min(bounds[0] / thumbnail.width, bounds[1] / thumbnail.height)
                 # Fit in both directions at canvas resolution, including upscale:
                 # thumbnail() alone leaves small cache images tiny after downsampling.
@@ -344,6 +371,21 @@ def _load_thumbnail(image_path):
                 return thumbnail.resize(size, Image.LANCZOS)
     except (OSError, ValueError, TypeError, Image.DecompressionBombError):
         return None
+
+
+def _gallery_count(item):
+    return item.get("gallery_count", min(3, item["image_count"]))
+
+
+def _gallery_paths(item):
+    paths = item.get("image_paths")
+    if not isinstance(paths, list) or not paths:
+        paths = [item.get("image_path")]
+    return paths[:_gallery_count(item)]
+
+
+def _gallery_size(count):
+    return ((920 - _GALLERY_GAP * (count - 1)) // count, _GALLERY_HEIGHT)
 
 
 def _metric_count(count):
@@ -360,14 +402,12 @@ def _metric_count(count):
 
 
 class _Canvas:
-    """Logical-pixel drawing on a supersampled image; text must stay in bounds."""
+    """Native-resolution long canvas with anti-aliased text and local shadows."""
 
     def __init__(self, fonts, height):
         self.fonts = fonts
         self.image = Image.new("RGB", (WIDTH * _SCALE, height * _SCALE), _BG)
         self.draw = ImageDraw.Draw(self.image)
-        self.shadows = Image.new("L", self.image.size, 0)
-        self._shadow_draw = ImageDraw.Draw(self.shadows)
 
     @staticmethod
     def _s(values):
@@ -398,15 +438,15 @@ class _Canvas:
                           width=width * _SCALE if outline else 0)
 
     def shadow(self, box, radius, strength):
-        """Queue an elevation shadow; composited under surfaces by ``elevate``."""
+        """Paint a local shadow without allocating a full long-page mask."""
         x0, y0, x1, y1 = box
-        self._shadow_draw.rounded_rectangle(self._s((x0 + 2, y0 + 6, x1 - 2, y1 + 6)),
-                                            radius=radius * _SCALE, fill=strength)
-
-    def elevate(self):
-        blurred = self.shadows.filter(ImageFilter.GaussianBlur(14 * _SCALE))
-        self.image.paste(Image.new("RGB", self.image.size, _SHADOW), mask=blurred)
-        self.shadows.close()
+        pad = 28
+        with Image.new("L", (x1 - x0 + 2 * pad, y1 - y0 + 2 * pad), 0) as mask:
+            ImageDraw.Draw(mask).rounded_rectangle(
+                (pad + 2, pad + 6, pad + x1 - x0 - 2, pad + y1 - y0 + 6),
+                radius=radius, fill=strength)
+            with mask.filter(ImageFilter.GaussianBlur(14)) as blurred:
+                self.image.paste(_SHADOW, (x0 - pad, y0 - pad, x1 + pad, y1 + pad), blurred)
 
     def tag(self, x, y, label, colors, size=19):
         background, border, ink = colors
@@ -425,37 +465,49 @@ class _Canvas:
                                    cx + 4, cy + 1, cx + 7, cy + 5)), fill=color)
         self.ellipse((cx + 2, cy - 5, cx + 6, cy - 1), fill=color)
 
-    def thumbnail(self, x, y, image):
-        width, height = _THUMB_SIZE
+    def thumbnail(self, x, y, image, size):
+        width, height = size
         self.box((x, y, x + width, y + height), 12, "#F7F8FA", _BORDER)
         # Contain within an inset frame: even screenshot corners stay visible.
-        left = round(x * _SCALE) + (width * _SCALE - image.width) // 2
-        top = round(y * _SCALE) + (height * _SCALE - image.height) // 2
-        self.image.paste(image, (left, top))
+        fit = min((width - 2 * _THUMB_PAD) / image.width,
+                  (height - 2 * _THUMB_PAD) / image.height)
+        fitted_size = tuple(max(1, round(edge * fit)) for edge in image.size)
+        with image.resize(fitted_size, Image.LANCZOS) as fitted:
+            left = x + (width - fitted.width) // 2
+            top = y + (height - fitted.height) // 2
+            self.image.paste(fitted, (left, top))
 
     def badge(self, cx, cy, glyph, fill, ink="#FFFFFF"):
         """Filled round status icon (info / warning) with a centered glyph."""
         self.ellipse((cx - 11, cy - 11, cx + 11, cy + 11), fill=fill)
         self.text((cx, cy + 1), glyph, 16, ink, bold=True, anchor="mm")
 
-    def finish(self):
-        result = self.image.resize((WIDTH, self.image.height // _SCALE), Image.LANCZOS)
+    def finish(self, height):
+        if height == self.image.height:
+            return self.image
+        result = self.image.crop((0, 0, WIDTH, height))
         self.image.close()
         return result
 
 
-def _item_layout(item, canvas, start, number, thumbnail):
+def _item_layout(item, canvas, start, number, gallery_count):
     clean = canvas.fonts.clean
-    text_width = 920 - _THUMB_SIZE[0] - _THUMB_GAP if thumbnail is not None else 920
-    title_text, summary_text = clean(item["title"], 320), clean(item["summary"])
-    title = canvas.wrap(title_text or "同学分享", 32, text_width, 2, bold=True)
-    title_key = re.sub(r"\s+", "", title_text)
-    summary_key = re.sub(r"\s+", "", summary_text)
-    # Keep the summary when the displayed title has lost detail to truncation.
-    duplicate = (bool(title_key.rstrip("。！？.!?"))
-                 and title_key.rstrip("。！？.!?") == summary_key.rstrip("。！？.!?")
-                 and re.sub(r"\s+", "", "".join(title)) == title_key)
-    summary = [] if duplicate else canvas.wrap(summary_text or "请查看原帖了解详情。", 26, text_width, 3)
+    raw_body = item.get("body")
+    if raw_body is None:
+        raw_body = item.get("summary", "")
+    original_text = clean(raw_body, 2000)
+    body_text = clean(raw_body, _BODY_LIMIT) or "原帖未提供文字。"
+    title_text = clean(item["title"], 320)
+    title_key = re.sub(r"\s+", "", title_text).rstrip("。！？.!?…")
+    body_key = re.sub(r"\s+", "", original_text).rstrip("。！？.!?")
+    duplicate_title = bool(title_key) and body_key.startswith(title_key)
+    title = canvas.wrap(title_text, 32, 920, 2, bold=True) if title_text and not duplicate_title else []
+    # Typical text gets up to 720 characters; the generous line bound also
+    # handles pathological line breaks while keeping all ten posts in one PNG.
+    body = canvas.wrap(body_text, 26, 920, _BODY_LINES)
+    excerpt = bool(item.get("truncated") or item.get("source_truncated")
+                   or len(str(raw_body)) > _BODY_LIMIT
+                   or re.sub(r"\s+", "", "".join(body)) != re.sub(r"\s+", "", body_text))
     category = canvas.wrap(clean(item["category"], 64).replace("\n", " ") or "校园日常", 19, 560, 1)[0]
     images = ""
     if item["image_count"]:
@@ -472,17 +524,18 @@ def _item_layout(item, canvas, start, number, thumbnail):
         if canvas.length(with_comments, 19) <= 920 - metrics_inset - canvas.length(source, 20) - 24:
             metrics = with_comments
     when = canvas.wrap(_published(item["published_at"], start), 20, 300, 1)[0]
-    # The image shares the bounded title/summary block instead of adding a row.
-    body_height = max(44 * len(title) + (10 + 39 * len(summary) if summary else 0),
-                      _THUMB_SIZE[1] if thumbnail is not None else 0)
+    title_height = 44 * len(title) + 10 if title else 0
+    body_height = title_height + 39 * len(body) + (32 if excerpt else 0)
+    if gallery_count:
+        body_height += 22 + _GALLERY_HEIGHT
     height = 28 + 32 + 18 + body_height + 18 + 16 + 24 + 24
-    return dict(title=title, summary=summary, category=category, source=source,
+    return dict(title=title, body=body, excerpt=excerpt, category=category, source=source,
                 images=images, when=when, height=height, number=number,
                 metrics=metrics, metrics_inset=metrics_inset,
-                colors=_tag_color(category), thumbnail=thumbnail, body_height=body_height)
+                colors=_tag_color(category), gallery_count=gallery_count, body_height=body_height)
 
 
-def _draw_item(canvas, item, y):
+def _draw_item(canvas, item, y, gallery):
     x0, x1 = 40, 1040
     left, right = x0 + 40, x1 - 40
     canvas.box((x0, y, x1, y + item["height"]), 16, _SURFACE, _BORDER)
@@ -495,15 +548,22 @@ def _draw_item(canvas, item, y):
     canvas.clock(right - when_width - 18, row + 16, _TEXT_3)
     row += 32 + 18
     body_top = row
-    if item["thumbnail"] is not None:
-        canvas.thumbnail(right - _THUMB_SIZE[0], row, item["thumbnail"])
     for line in item["title"]:
         canvas.text((left, row), line, 32, _TEXT, bold=True)
         row += 44
-    row += 10 if item["summary"] else 0
-    for line in item["summary"]:
+    row += 10 if item["title"] else 0
+    for line in item["body"]:
         canvas.text((left, row), line, 26, _TEXT_2)
         row += 39
+    if item["excerpt"]:
+        canvas.text((left, row + 4), "原文节选", 19, _TEXT_3)
+        row += 32
+    if gallery:
+        row += 22
+        # Failed slots disappear; surviving photos keep their contained fit.
+        size = _gallery_size(len(gallery))
+        for index, image in enumerate(gallery):
+            canvas.thumbnail(left + index * (size[0] + _GALLERY_GAP), row, image, size)
     row = body_top + item["body_height"] + 18
     canvas.line(((left, row), (right, row)), _DIVIDER)
     row += 16 + 12
@@ -575,16 +635,44 @@ def _overview(canvas, digest, start, end, shown, intro, y):
     return height
 
 
-def _page(digest, start, end, items, fonts, page_index, pages, shown, thumbnails):
+def plan_digest(digest: dict, font_path="") -> dict:
+    """Pure selection plan: one image, first ten eligible items, supplied order.
+
+    No fonts or photos are opened and no output is written. ``font_path`` is
+    accepted for call-site compatibility; selection no longer depends on it.
+    Indices remain valid after pruning ``items[:plan['shown']]``. The caller
+    may carry earlier omissions in ``digest.omitted``; rendering honors them.
+    """
+    _, _, eligible = _validate(digest)
+    shown = min(10, len(eligible))
+    return {"pages": [list(range(shown))] if shown else [],
+            "shown": shown, "omitted": len(eligible) - shown}
+
+
+def _check_plan(plan):
+    if not isinstance(plan, dict) or not {"pages", "shown", "omitted"}.issubset(plan):
+        raise RenderError("Invalid digest plan")
+    shown, omitted = plan["shown"], plan["omitted"]
+    if type(shown) is not int or not 0 <= shown <= 10 or type(omitted) is not int or omitted < 0:
+        raise RenderError("Invalid planned counts")
+    expected = [list(range(shown))] if shown else []
+    pages = plan["pages"]
+    if (pages != expected or not isinstance(pages, list)
+            or any(type(i) is not int for group in pages for i in group)):
+        raise RenderError("Plan must contain one contiguous prefix of at most ten posts")
+
+
+def _page(digest, start, end, items, fonts, shown, omitted):
     hours = f"{(end - start).total_seconds() / 3600:g}"
-    probe = _Canvas(fonts, 1)  # Measure with the exact supersampled fonts.
+    probe = _Canvas(fonts, 1)  # Same native font metrics as the final long image.
     probe.image.close()
     intro_text = fonts.clean(digest["intro"], 512) or "把刚刚发生的校园小事，收进这一页。"
     intro = probe.wrap(intro_text, 23, 880, 2)
-    layouts = [_item_layout(item, probe, start, page_index * 4 + i + 1, thumbnails[i])
+    layouts = [_item_layout(item, probe, start, i + 1, _gallery_count(item))
                for i, item in enumerate(items)]
-    notice = probe.wrap("查看全文：/校园圈 详情 <帖子ID>　查看配图：/校园圈 图片 <帖子ID>",
+    notice = probe.wrap("查看全文：/校园墙 详情 <帖子ID>　查看配图：/校园墙 图片 <帖子ID>",
                         19, 900, 2)
+    notice.append(f"已展示 {shown} 条入选帖 · 未展示 {_metric_count(omitted)} 条")
     overview_top = 232
     overview = 172 + 24 + 36 * len(intro) + 26
     top = overview_top + overview + 28
@@ -597,19 +685,28 @@ def _page(digest, start, end, items, fonts, page_index, pages, shown, thumbnails
 
     canvas = _Canvas(fonts, height)
     try:
-        canvas.shadow((40, overview_top, 1040, overview_top + overview), 20, 46)
-        y = top
-        for item in layouts:
-            canvas.shadow((40, y, 1040, y + item["height"]), 16, 26)
-            y += item["height"] + 20
-        canvas.elevate()
         _header(canvas, digest, hours)
+        canvas.shadow((40, overview_top, 1040, overview_top + overview), 20, 46)
         _overview(canvas, digest, start, end, shown, intro, overview_top)
         y = top
-        for item in layouts:
-            _draw_item(canvas, item, y)
-            y += item["height"] + 20
+        for index, (source, item) in enumerate(zip(items, layouts)):
+            # At most this post's three resized photos are alive. Source JPEGs
+            # close inside the loader, and every gallery closes before the next.
+            with ExitStack() as resources:
+                gallery = []
+                for path in _gallery_paths(source):
+                    photo = _load_thumbnail(path, (920, _GALLERY_HEIGHT))
+                    if photo is not None:
+                        resources.callback(photo.close)
+                        gallery.append(photo)
+                if len(gallery) != item["gallery_count"]:
+                    item = _item_layout(source, probe, start, index + 1, len(gallery))
+                canvas.shadow((40, y, 1040, y + item["height"]), 16, 26)
+                _draw_item(canvas, item, y, gallery)
+                y += item["height"] + 20
 
+        bottom = y - 20
+        actual_height = bottom + 28 + alert + note + 22 + 60
         y = bottom + 28
         if digest["scan_limited"]:
             background, border, ink = _TAGS["gold"]
@@ -623,65 +720,274 @@ def _page(digest, start, end, items, fonts, page_index, pages, shown, thumbnails
             canvas.text((92, y + 18 + 15 + 30 * i), line, 19, _TEXT_2, anchor="lm")
         y += note + 22 + 30
         canvas.text((44, y), f"每 {hours} 小时一辑·云上校友圈", 18, _TEXT_3, anchor="lm")
-        label = f"{page_index + 1} / {pages}"
+        label = "1 / 1"
         canvas.text((1036, y), label, 20, _TEXT_2, bold=True, anchor="rm")
         dots = 1036 - canvas.length(label, 20, True) - 18
-        for i in reversed(range(pages)):
-            active = i == page_index
-            width = 22 if active else 8
-            canvas.box((dots - width, y - 4, dots, y + 4), 4, _BRAND if active else "#C9CDD4")
-            dots -= width + 8
-        return canvas.finish()
+        canvas.box((dots - 22, y - 4, dots, y + 4), 4, _BRAND)
+        return canvas.finish(actual_height)
     except Exception:
         canvas.image.close()
         raise
 
 
-def render_digest(digest: dict, output_dir, font_path="") -> list[str]:
-    """Render at most eight posts, four per page, at 1080px and <=2400px tall.
+def render_digest(digest: dict, output_dir, font_path="", plan=None) -> list[str]:
+    """Render up to ten ranked posts into ONE 1080px PNG, at most 16000px tall.
 
     ``window_start``/``window_end`` must be aware ISO strings. Display uses
-    Beijing time. ``shown`` selects the first N items and is capped at eight;
-    the displayed count always matches the actual rendered selection. An empty
-    selection returns [] without requiring Pillow, a font, or an output folder.
-    Each call uses unique filenames and removes its own files if any page fails.
+    Beijing time. ``shown`` selects a prefix, capped at ten without reordering.
+    An empty selection returns [] without requiring Pillow/fonts/output folders.
+    Optional ``plan`` is the single-group dict from ``plan_digest`` and remains
+    valid after the caller prunes items; omissions still appear on the image.
+    Failed writes remove only this call's temporary output.
 
-    An item's optional ``image_path`` is a trusted local cache JPEG (str/Path),
-    already orientation-normalized with edges <=2048px. One contained thumbnail
-    is shown; ``image_count`` remains the total number of original attachments.
-    Missing, unreadable or corrupt images use the unchanged full-width text
-    layout. This renderer never downloads, changes or deletes the cached image.
+    ``body`` is the sanitized original text; only legacy items use ``summary``.
+    Body excerpts preserve paragraphs, show up to 720 characters / 21 wrapped
+    lines at 26px, and mark clipping or source truncation with 原文节选. A duplicate
+    title is omitted, never the body. Titles and body both occupy the full width.
+
+    ``image_paths`` supplies up to three trusted, normalized cache JPEGs (edges
+    <=2048px); legacy ``image_path`` is the fallback. ``gallery_count`` (0..3)
+    is authoritative, falling back to min(3, image_count). Photos are contained
+    below the text. Failed galleries collapse without changing post selection.
+    Decode/close is sequential per post, onto one native-resolution canvas.
+    No network access or cache modifications occur.
 
     Optional ``like_count``/``trace_count``/``comment_count`` are non-negative
     integers or None (unknown). Likes and follows always show; comments appear
     only if they fit without crowding the source or image counter. Unknown likes
     and follows use —, zero stays 0, large counts use 万/亿 (capped at 999亿+).
     ``ranking='likes'`` selects ranked labels; item selection/order is the caller's
-    responsibility. Legacy digests can still supply eight items over two pages.
+    responsibility.
     """
     created = []
     pending = None
     try:
-        start, end, selected = _validate(digest)
+        if plan is None:
+            plan = plan_digest(digest, font_path)
+        _check_plan(plan)
+        start, end, selected = _validate(digest, plan["shown"])
         if not selected:
             return []
+        omitted = digest.get("omitted", 0)
+        if type(omitted) is not int or omitted < 0:
+            raise RenderError("omitted must be a non-negative integer")
+        omitted = max(omitted, plan["omitted"], digest["total"] - len(selected))
         fonts = _Fonts(font_path)
         directory = Path(output_dir).expanduser().resolve()
         directory.mkdir(parents=True, exist_ok=True)
         batch = f"campus-{end:%Y%m%d-%H%M}-{uuid4().hex}"
-        pages = (len(selected) + 3) // 4
+        output = directory / f"{batch}-01.png"
+        pending = output.with_suffix(".tmp")
+        image = _page(digest, start, end, selected, fonts, len(selected), omitted)
+        try:
+            image.save(pending, format="PNG", optimize=True)
+        finally:
+            image.close()
+        pending.replace(output)
+        created.append(str(output))
+        pending = None
+        return created
+    except Exception as exc:
+        for owned in ([pending] if pending is not None else []) + [Path(p) for p in created]:
+            try:
+                owned.unlink(missing_ok=True)
+            except OSError:
+                pass
+        if isinstance(exc, RenderError):
+            raise
+        raise RenderError("Digest rendering failed; use the text fallback") from exc
+
+
+def _detail_record(post):
+    """Validate detail inputs without importing digest selection or AI fields."""
+    if (not isinstance(post, dict) or not str(post.get("id") or "").strip()
+            or not isinstance(post.get("text"), str)):
+        raise RenderError("Post detail requires a source ID and original text")
+    if len(post["text"]) > _DETAIL_CHAR_LIMIT:
+        raise RenderError("Post detail exceeds 20000 characters; use the full-text attachment")
+    record = dict(post)
+    paths = post.get("image_paths")
+    fallback_count = len(paths) if isinstance(paths, list) else int(bool(post.get("image_path")))
+    record.setdefault("image_count", fallback_count)
+    if type(record["image_count"]) is not int or record["image_count"] < 0:
+        raise RenderError("image_count must be a non-negative integer")
+    if "gallery_count" in record and (type(record["gallery_count"]) is not int
+                                      or not 0 <= record["gallery_count"] <= 3):
+        raise RenderError("gallery_count must be an integer between zero and three")
+    for key in ("like_count", "trace_count", "comment_count"):
+        count = record.get(key)
+        if count is not None and (type(count) is not int or count < 0):
+            raise RenderError(f"{key} must be a non-negative integer or None")
+    return record
+
+
+def _load_detail_qr(value):
+    """Decode only a bounded official JPEG data URL, keeping its quiet edges."""
+    prefix = "data:image/jpeg;base64,"
+    max_bytes = 512 * 1024
+    if not isinstance(value, str) or not value.startswith(prefix):
+        return None
+    if len(value) - len(prefix) > 4 * ((max_bytes + 2) // 3):
+        return None
+    try:
+        decoded = base64.b64decode(value[len(prefix):], validate=True)
+        if not decoded or len(decoded) > max_bytes:
+            return None
+        with ExitStack() as resources:
+            source = resources.enter_context(Image.open(BytesIO(decoded), formats=("JPEG",)))
+            if source.width * source.height > 1_000_000:
+                return None
+            rgb = source.convert("RGB")  # Fully decode so truncated files cannot reach the card.
+            resources.callback(rgb.close)
+            fit = min(_DETAIL_QR_EDGE / rgb.width, _DETAIL_QR_EDGE / rgb.height, 1)
+            if fit < 1:
+                fitted = rgb.resize(tuple(max(1, round(edge * fit)) for edge in rgb.size),
+                                    Image.Resampling.NEAREST)
+                resources.callback(fitted.close)
+            else:
+                fitted = rgb  # The official 430px code retains its original decoded pixels.
+            edge = _DETAIL_QR_EDGE + 2 * _DETAIL_QR_PAD
+            tile = Image.new("RGB", (edge, edge), "white")
+            tile.paste(fitted, ((edge - fitted.width) // 2, (edge - fitted.height) // 2))
+            return tile
+    except (binascii.Error, ValueError, OSError, Image.DecompressionBombError):
+        return None
+
+
+def _detail_page(metadata, lines, fonts, page_index, pages, gallery, qr=None):
+    """Render one bounded native page; no canvas survives its save/close cycle."""
+    note = 36 + 30 * len(metadata["notice"])
+    body_top = 352
+    bottom = body_top + 39 * len(lines) + (22 + _GALLERY_HEIGHT if gallery else 0) + 28
+    if qr is not None:
+        bottom += _DETAIL_QR_SPACE
+    height = bottom + 24 + note + 82
+    if height > MAX_HEIGHT:
+        raise RenderError("Post detail page exceeds its maximum height")
+    canvas = _Canvas(fonts, height)
+    try:
+        canvas.box((0, 0, WIDTH, 260), 0, _BRAND)
+        canvas.text((56, 40), "校园墙 · 原帖详情", 19, "#DCE6FF", bold=True)
+        canvas.text((54, 82), "帖子全文", 48, "#FFFFFF", bold=True)
+        canvas.text((56, 152), metadata["community"], 24, "#DCE6FF")
+        canvas.shadow((40, 232, 1040, bottom), 16, 26)
+        canvas.box((40, 232, 1040, bottom), 16, _SURFACE, _BORDER)
+        canvas.text((80, 270), metadata["source"], 22, _TEXT, anchor="lm")
+        canvas.text((1000, 270), metadata["when"], 20, _TEXT_3, anchor="rm")
+        canvas.text((80, 310), metadata["metrics"], 19, _TEXT_2, anchor="lm")
+        if metadata["images"]:
+            canvas.text((1000, 310), metadata["images"], 20, _TEXT_3, anchor="rm")
+            canvas.picture(980 - canvas.length(metadata["images"], 20), 310, _TEXT_3)
+        canvas.line(((80, 332), (1000, 332)), _DIVIDER)
+        row = body_top
+        for line in lines:
+            canvas.text((80, row), line, 26, _TEXT_2)
+            row += 39
+        if gallery:
+            row += 22
+            size = _gallery_size(len(gallery))
+            for index, photo in enumerate(gallery):
+                canvas.thumbnail(80 + index * (size[0] + _GALLERY_GAP), row, photo, size)
+            row += _GALLERY_HEIGHT
+        if qr is not None:
+            row += 24
+            canvas.image.paste(qr, ((WIDTH - qr.width) // 2, row))
+            canvas.text((WIDTH // 2, row + qr.height + 16), "微信扫码打开原帖",
+                        22, _TEXT_2, anchor="mt")
+        row = bottom + 24
+        canvas.box((40, row, 1040, row + note), 10, "#E9EBEE")
+        canvas.badge(68, row + 33, "i", _TEXT_3)
+        for index, line in enumerate(metadata["notice"]):
+            canvas.text((92, row + 33 + index * 30), line, 19, _TEXT_2, anchor="lm")
+        row += note + 52
+        canvas.text((44, row), "云上校友圈 · 原帖全文", 18, _TEXT_3, anchor="lm")
+        canvas.text((1036, row), f"{page_index + 1} / {pages}", 20, _TEXT_2, bold=True, anchor="rm")
+        return canvas.finish(height)
+    except Exception:
+        canvas.image.close()
+        raise
+
+
+def render_post_detail(post: dict, community, output_dir, font_path="") -> list[str]:
+    """Render the FULL supplied ``post['text']`` in ordered absolute PNG paths.
+
+    Normal posts use one image; longer bodies split at wrapped-line boundaries
+    into at most three 1080px-wide pages of at most 16000px. Inputs over 20000
+    characters or three pages raise RenderError before any page canvas/file is
+    created, so the caller can attach the full text. Accepted text is never
+    clipped or summarized; every paragraph/blank line appears once.
+    ``id`` and string ``text`` are required; time and engagement counts are
+    optional. Local ``image_paths`` / legacy ``image_path`` use the same trusted
+    JPEG and optional ``gallery_count`` contract as the digest (at most three).
+    Photos appear once, after the final body line, and unreadable files fall back
+    gracefully. Optional ``mini_app_qr_data_url`` is the official JPEG data URL
+    (<=512 KiB decoded, <=1M pixels); its 430px code and quiet edges appear after
+    photos on the last page only. Invalid data omits that section. No source URL
+    or QR is synthesized. Canvases are saved/closed one at a time, without
+    network access. On failure only this call's files are removed. Run in the
+    caller's worker thread; catch RenderError for its full-text fallback.
+    """
+    created, pending, qr = [], None, None
+    try:
+        record = _detail_record(post)
+        fonts = _Fonts(font_path)
+
+        def wrap(text, size, width, limit):
+            return _wrap(text, fonts.get(size), width, limit)
+
+        source_id = fonts.clean(record["id"], 128).replace("\n", " ")
+        try:
+            timestamp = datetime.fromisoformat(str(record.get("published_at")))
+            timestamp = timestamp.replace(tzinfo=_CST) if timestamp.utcoffset() is None else timestamp.astimezone(_CST)
+            when = timestamp.strftime("%Y.%m.%d %H:%M")
+        except (ValueError, OverflowError):
+            when = "时间未提供"
+        metrics = f"点赞 {_metric_count(record.get('like_count'))} · 蹲蹲 {_metric_count(record.get('trace_count'))}"
+        if record.get("comment_count") is not None:
+            metrics += f" · 评论 {_metric_count(record['comment_count'])}"
+        count = record["image_count"]
+        images = f"配图{count if count < 1000 else '999+'}张" if count else ""
+        metadata = dict(
+            source=wrap("原帖 #" + source_id, 22, 520, 1)[0],
+            community=wrap(fonts.clean(community, 256).replace("\n", " "), 24, 960, 1)[0],
+            when=when, metrics=metrics, images=images,
+            notice=wrap(f"查看原帖：/校园墙 详情 {source_id}　查看配图：/校园墙 图片 {source_id}", 19, 900, 2))
+        qr = _load_detail_qr(record.get("mini_app_qr_data_url"))
+        fixed_height = 352 + 28 + 24 + 36 + 30 * len(metadata["notice"]) + 82
+        gallery_space = 22 + _GALLERY_HEIGHT if _gallery_count(record) else 0
+        qr_space = _DETAIL_QR_SPACE if qr is not None else 0
+        per_page = (MAX_HEIGHT - fixed_height - gallery_space - qr_space) // 39
+        if per_page < 1:
+            raise RenderError("Post detail body region is too small")
+        # Reserve final-page media before wrapping. Stop after one overflow line,
+        # before allocating any page canvas or creating any output files.
+        raw = record["text"].replace("\r\n", "\n").replace("\r", "\n")
+        lines = []
+        for paragraph in raw.split("\n"):
+            cleaned = fonts.clean(paragraph, len(paragraph))
+            remaining = per_page * _DETAIL_PAGE_LIMIT - len(lines)
+            lines.extend(wrap(cleaned, 26, 920, remaining + 1))
+            if len(lines) > per_page * _DETAIL_PAGE_LIMIT:
+                raise RenderError("Post detail exceeds 3 pages; use the full-text attachment")
+        if not raw.strip():
+            lines = ["原帖未提供文字。"]
+        pages = (len(lines) + per_page - 1) // per_page
+        directory = Path(output_dir).expanduser().resolve()
+        directory.mkdir(parents=True, exist_ok=True)
+        batch = f"campus-detail-{uuid4().hex}"
         for index in range(pages):
             output = directory / f"{batch}-{index + 1:02}.png"
             pending = output.with_suffix(".tmp")
-            items = selected[index * 4:(index + 1) * 4]
             with ExitStack() as resources:
-                thumbnails = []
-                for item in items:
-                    thumbnail = _load_thumbnail(item.get("image_path"))
-                    thumbnails.append(resources.enter_context(thumbnail)
-                                      if thumbnail is not None else None)
-                image = _page(digest, start, end, items, fonts, index, pages,
-                              len(selected), thumbnails)
+                gallery = []
+                if index == pages - 1:
+                    for path in _gallery_paths(record):
+                        photo = _load_thumbnail(path, (920, _GALLERY_HEIGHT))
+                        if photo is not None:
+                            resources.callback(photo.close)
+                            gallery.append(photo)
+                image = _detail_page(metadata, lines[index * per_page:(index + 1) * per_page],
+                                     fonts, index, pages, gallery, qr if index == pages - 1 else None)
             try:
                 image.save(pending, format="PNG", optimize=True)
             finally:
@@ -698,4 +1004,7 @@ def render_digest(digest: dict, output_dir, font_path="") -> list[str]:
                 pass
         if isinstance(exc, RenderError):
             raise
-        raise RenderError("Digest rendering failed; use the text fallback") from exc
+        raise RenderError("Post detail rendering failed; use the text fallback") from exc
+    finally:
+        if qr is not None:
+            qr.close()

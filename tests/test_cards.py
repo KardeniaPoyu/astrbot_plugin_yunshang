@@ -1,6 +1,8 @@
 """Renderer contracts, real font layout, and saved PNG integration checks."""
 
+import base64
 import copy
+from io import BytesIO
 from pathlib import Path
 import tempfile
 import unittest
@@ -37,7 +39,7 @@ class CardsTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.fonts = self.cards._Fonts("")
 
-    def render_with_text(self, digest, positions=None):
+    def render_with_text(self, digest, positions=None, plan=None):
         """Observe the real Pillow draw calls while still drawing every glyph."""
         drawn = []
         original = ImageDraw.ImageDraw.text
@@ -55,14 +57,279 @@ class CardsTests(unittest.TestCase):
             return original(draw, xy, text, *args, **kwargs)
 
         with patch.object(ImageDraw.ImageDraw, "text", capture):
-            paths = self.cards.render_digest(digest, self.temp.name)
+            paths = self.cards.render_digest(digest, self.temp.name, plan=plan)
         return paths, "\n".join(drawn)
+
+    def render_detail_with_text(self, post):
+        drawn, body = [], []
+        original = ImageDraw.ImageDraw.text
+
+        def capture(draw, xy, text, *args, **kwargs):
+            font = kwargs["font"]
+            box = draw.textbbox(xy, text, font=font, anchor=kwargs.get("anchor"))
+            self.assertGreaterEqual(min(box[:2]), 0)
+            self.assertLessEqual(box[2], draw.im.size[0])
+            self.assertLessEqual(box[3], draw.im.size[1])
+            drawn.append(text)
+            if font.size == 26:
+                body.append(text)
+            return original(draw, xy, text, *args, **kwargs)
+
+        with patch.object(ImageDraw.ImageDraw, "text", capture):
+            paths = self.cards.render_post_detail(post, "合成校园墙", self.temp.name)
+        return paths, "\n".join(drawn), body
+
+    def test_detail_keeps_full_5000_character_text_and_tail_without_ai_summary(self):
+        tail = "原文尾部完整保留"
+        post = dict(id="DETAIL-001", text="文" * (5000 - len(tail)) + tail,
+                    title="不能出现的AI标题", summary="不能替代原文的AI摘要", body="错误的摘要正文",
+                    published_at="2026-11-12T06:15:00+00:00", like_count=128,
+                    trace_count=7, comment_count=3, image_count=0)
+        before = copy.deepcopy(post)
+        paths, text, body = self.render_detail_with_text(post)
+        self.assertEqual(post, before)
+        self.assertEqual(len(paths), 1)
+        self.assertEqual("".join(body), post["text"])
+        for expected in ("帖子全文", "DETAIL-001", "2026.11.12 14:15", "点赞 128",
+                         "蹲蹲 7", "评论 3", "/校园墙 详情", "/校园墙 图片"):
+            self.assertIn(expected, text)
+        for forbidden in ("不能出现的AI标题", "AI摘要", "错误的摘要正文", "原文节选", "/校园圈"):
+            self.assertNotIn(forbidden, text)
+        with Image.open(paths[0]) as image:
+            self.assertEqual(image.width, 1080)
+            self.assertLessEqual(image.height, 16000)
+            self.assertGreater(image.height, 5000)
+
+    def test_detail_splits_every_paragraph_once_and_closes_each_native_page(self):
+        paragraphs = [f"第{i:03}段合成原文，每段都需要完整展示。" for i in range(420)]
+        post = dict(id="DETAIL-002", text="\n\n".join(paragraphs) + "\n最后一段尾声")
+        saved, allocations = [], []
+        original_save, original_new = Image.Image.save, Image.new
+
+        def save_one_page(image, *args, **kwargs):
+            if saved:
+                with self.assertRaises(ValueError):
+                    saved[-1].getpixel((0, 0))
+            result = original_save(image, *args, **kwargs)
+            saved.append(image)
+            return result
+
+        def native_only(mode, size, *args, **kwargs):
+            allocations.append(size)
+            return original_new(mode, size, *args, **kwargs)
+
+        with patch.object(Image.Image, "save", save_one_page), patch.object(Image, "new", native_only):
+            paths, text, body = self.render_detail_with_text(post)
+        self.assertGreater(len(paths), 1)
+        self.assertEqual(body, post["text"].split("\n"))
+        for paragraph in paragraphs:
+            self.assertEqual(body.count(paragraph), 1)
+        for image in saved:
+            with self.assertRaises(ValueError):
+                image.getpixel((0, 0))
+        self.assertTrue(all(w <= 1080 and h <= 16000 for w, h in allocations))
+        for page, path in enumerate(paths, 1):
+            self.assertTrue(Path(path).is_absolute())
+            self.assertIn(f"{page} / {len(paths)}", text)
+            with Image.open(path) as image:
+                self.assertEqual(image.width, 1080)
+                self.assertLessEqual(image.height, 16000)
+
+    def test_detail_embeds_up_to_three_local_photos_and_closes_them(self):
+        colors = ((204, 14, 157), (17, 191, 70), (242, 208, 10), (11, 211, 213))
+        photos = []
+        for i, color in enumerate(colors):
+            path = Path(self.temp.name) / f"detail-synthetic-{i}.jpg"
+            with Image.new("RGB", (160, 160), color) as source:
+                source.save(path, quality=95, subsampling=0)
+            photos.append(str(path))
+        loaded = []
+        original = self.cards._load_thumbnail
+
+        def track_photo(*args):
+            image = original(*args)
+            loaded.append(image)
+            return image
+
+        post = dict(id="DETAIL-003", text="这是合成原文。\n\n三张配图展示在正文下方。",
+                    image_paths=photos, image_count=4)
+        with patch.object(self.cards, "_load_thumbnail", track_photo):
+            paths, text, body = self.render_detail_with_text(post)
+        self.assertEqual(len(paths), 1)
+        self.assertEqual(body, post["text"].split("\n"))
+        self.assertEqual(len(loaded), 3)
+        self.assertIn("配图4张", text)
+        for image in loaded:
+            with self.assertRaises(ValueError):
+                image.getpixel((0, 0))
+        with Image.open(paths[0]) as image:
+            for color in colors[:3]:
+                self.assertGreater(self.color_region(image, color)[1], 1000)
+            self.assertEqual(self.color_region(image, colors[3])[1], 0)
+
+    def test_detail_failed_gallery_and_later_write_failure_leave_no_partial_batch(self):
+        corrupt = Path(self.temp.name) / "corrupt-detail.jpg"
+        corrupt.write_bytes(b"synthetic corrupt JPEG")
+        post = dict(id="DETAIL-004", text="原文仍然完整。", image_count=2,
+                    image_paths=[str(corrupt), str(Path(self.temp.name) / "missing.jpg")])
+        paths, _, body = self.render_detail_with_text(post)
+        self.assertEqual(body, [post["text"]])
+        existing = {path: path.read_bytes() for path in Path(self.temp.name).iterdir()}
+        post["text"] = "完整原文\n\n" * 400
+        original, calls = Image.Image.save, 0
+
+        def fail_second(image, fp, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                Path(fp).write_bytes(b"partial PNG")
+                raise OSError("synthetic second-page failure")
+            return original(image, fp, *args, **kwargs)
+
+        with patch.object(Image.Image, "save", fail_second), self.assertRaises(self.cards.RenderError):
+            self.cards.render_post_detail(post, "合成校园墙", self.temp.name)
+        self.assertEqual({path: path.read_bytes() for path in Path(self.temp.name).iterdir()}, existing)
+
+    def test_detail_requires_original_text_and_source_id(self):
+        for post in ({"id": "D", "summary": "AI摘要"}, {"id": "", "text": "原文"},
+                     {"id": "D", "text": None}, {"id": "D", "text": "原文", "like_count": -1}):
+            with self.subTest(post=post), self.assertRaises(self.cards.RenderError):
+                self.cards.render_post_detail(post, "合成校园墙", self.temp.name)
+        self.assertFalse(list(Path(self.temp.name).iterdir()))
+
+    def test_wrap_measurement_work_is_linear_and_probes_are_bounded(self):
+        class CountingFont:
+            measured = 0
+            longest_probe = 0
+
+            def getlength(self, text):
+                self.measured += len(text)
+                self.longest_probe = max(self.longest_probe, len(text))
+                return len(text) * 26
+
+        for length in (20_000, 300_000):
+            with self.subTest(length=length):
+                font = CountingFont()
+                source = "文" * length
+                lines = self.cards._wrap(source, font, 920, length)
+                self.assertEqual("".join(lines), source)
+                self.assertLessEqual(font.longest_probe, 512)
+                self.assertLess(font.measured, length * 12)
+
+    def test_detail_excessive_characters_or_pages_raise_before_canvas_or_files(self):
+        for text, message in (("文" * 20_001, "20000"),
+                              ("完整一行\n" * 1300, "3 pages")):
+            with self.subTest(message=message), patch.object(self.cards, "_Canvas") as canvas:
+                with self.assertRaisesRegex(self.cards.RenderError, message):
+                    self.cards.render_post_detail(dict(id="TOO-LONG", text=text),
+                                                  "合成校园墙", self.temp.name)
+                canvas.assert_not_called()
+                self.assertFalse(list(Path(self.temp.name).iterdir()))
+
+    def test_detail_accepts_exactly_20000_characters_without_losing_tail(self):
+        source = "文" * 19_990 + "最后十字必须全部保留"
+        self.assertEqual(len(source), 20_000)
+        paths, _, body = self.render_detail_with_text(dict(id="LIMIT", text=source))
+        self.assertEqual("".join(body), source)
+        self.assertLessEqual(len(paths), 3)
+        for path in paths:
+            with Image.open(path) as rendered:
+                self.assertLessEqual(rendered.height, 16000)
+
+    def synthetic_qr_url(self, size=(430, 430), image_format="JPEG"):
+        """A labeled test pattern, never a generated destination/mini-app code."""
+        buffer = BytesIO()
+        with Image.new("RGB", size, "white") as source:
+            draw = ImageDraw.Draw(source)
+            draw.rectangle((20, 20, 50, 50), fill=(204, 14, 157))
+            draw.rectangle((100, 100, 330, 330), fill="#102020")
+            draw.rectangle((130, 130, 300, 300), fill="white")
+            draw.rectangle((180, 180, 250, 250), fill="#102020")
+            source.save(buffer, format=image_format, quality=95, subsampling=0)
+        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+        return "data:image/jpeg;base64," + encoded, buffer.getvalue()
+
+    def test_detail_official_qr_keeps_430_native_pixels_and_margin_after_photos(self):
+        data_url, jpeg = self.synthetic_qr_url()
+        photo = Path(self.temp.name) / "detail-before-qr.jpg"
+        with Image.new("RGB", (160, 160), (17, 191, 70)) as sample:
+            sample.save(photo, quality=95, subsampling=0)
+        post = dict(id="QR-DETAIL", text="完整原文，不为小程序码截短。", image_count=1,
+                    image_paths=[str(photo)], mini_app_qr_data_url=data_url)
+        loaded = []
+        original = self.cards._load_detail_qr
+
+        def track_qr(value):
+            qr = original(value)
+            loaded.append(qr)
+            return qr
+
+        with patch.object(self.cards, "_load_detail_qr", track_qr):
+            paths, text, body = self.render_detail_with_text(post)
+        self.assertEqual(len(paths), 1)
+        self.assertEqual(body, [post["text"]])
+        self.assertEqual(text.count("微信扫码打开原帖"), 1)
+        with Image.open(paths[0]) as rendered, Image.open(BytesIO(jpeg)) as decoded:
+            qr_marker, pixels = self.color_region(rendered, (204, 14, 157))
+            photo_box, _ = self.color_region(rendered, (17, 191, 70))
+            self.assertGreater(pixels, 100)
+            left, top = qr_marker[0] - 20, qr_marker[1] - 20
+            self.assertGreater(top, photo_box[3])
+            # The full official 430px image survives byte-for-byte after JPEG
+            # decode, including all four quiet edges; it is never cropped/resized.
+            self.assertEqual(rendered.crop((left, top, left + 430, top + 430)).tobytes(), decoded.convert("RGB").tobytes())
+            self.assertEqual(rendered.getpixel((left - 8, top + 215)), (255, 255, 255))
+        for qr in loaded:
+            with self.assertRaises(ValueError):
+                qr.getpixel((0, 0))
+
+    def test_detail_qr_only_on_last_bounded_page_with_all_body_lines(self):
+        data_url, _ = self.synthetic_qr_url()
+        post = dict(id="QR-LONG", text="\n".join(f"完整第{i:03}行" for i in range(430)),
+                    mini_app_qr_data_url=data_url)
+        paths, text, body = self.render_detail_with_text(post)
+        self.assertGreater(len(paths), 1)
+        self.assertEqual(body, post["text"].split("\n"))
+        self.assertEqual(text.count("微信扫码打开原帖"), 1)
+        for index, path in enumerate(paths):
+            with Image.open(path) as rendered:
+                self.assertLessEqual(rendered.height, 16000)
+                _, pixels = self.color_region(rendered, (204, 14, 157))
+                self.assertEqual(pixels > 0, index == len(paths) - 1)
+
+    def test_invalid_or_oversized_detail_qr_is_identical_to_no_qr(self):
+        valid, jpeg = self.synthetic_qr_url()
+        too_many_pixels, _ = self.synthetic_qr_url((1001, 1000))
+        mislabeled_png, _ = self.synthetic_qr_url(image_format="PNG")
+        over_bytes = "data:image/jpeg;base64," + base64.b64encode(jpeg + b"x" * (512 * 1024)).decode("ascii")
+        broken_jpeg = "data:image/jpeg;base64," + base64.b64encode(jpeg[:700]).decode("ascii")
+        post = dict(id="QR-BAD", text="原文必须完整保留。\n\n来源命令也保留。")
+        paths, expected_text, expected_body = self.render_detail_with_text(post)
+        with Image.open(paths[0]) as rendered:
+            expected_size, expected_pixels = rendered.size, rendered.tobytes()
+        for value in (None, "", "https://example.invalid/qr.jpg", "data:image/jpeg;base64,%%%",
+                      valid.replace("image/jpeg", "image/png"), over_bytes,
+                      too_many_pixels, mislabeled_png, broken_jpeg):
+            with self.subTest(kind=str(value)[:40]):
+                post["mini_app_qr_data_url"] = value
+                paths, text, body = self.render_detail_with_text(post)
+                self.assertEqual((text, body), (expected_text, expected_body))
+                with Image.open(paths[0]) as rendered:
+                    self.assertEqual((rendered.size, rendered.tobytes()), (expected_size, expected_pixels))
+
+    def test_digest_does_not_decode_or_display_detail_qr(self):
+        digest = fixture(1)
+        digest["items"][0]["mini_app_qr_data_url"] = self.synthetic_qr_url()[0]
+        with patch.object(self.cards, "_load_detail_qr", side_effect=AssertionError("QR on digest")):
+            paths, text = self.render_with_text(digest)
+        self.assertEqual(len(paths), 1)
+        self.assertNotIn("微信扫码打开原帖", text)
 
     def test_png_pagination_counts_provenance_and_timezone(self):
         digest = fixture(8, scan_limited=True)
         before = copy.deepcopy(digest)
         paths, text = self.render_with_text(digest)
-        self.assertEqual(len(paths), 2)
+        self.assertEqual(len(paths), 1)
         self.assertEqual(digest, before)
         for path in paths:
             self.assertTrue(Path(path).is_absolute())
@@ -70,11 +337,10 @@ class CardsTests(unittest.TestCase):
                 self.assertEqual(im.format, "PNG")
                 self.assertEqual(im.mode, "RGB")
                 self.assertEqual(im.width, 1080)
-                self.assertLessEqual(im.height, 2400)
-                self.assertGreater(im.height, 1000)
+                self.assertLessEqual(im.height, 16000)
             self.assertLess(Path(path).stat().st_size, 2_000_000)
         for expected in ("本期展示", "12:00", "16:00", "北京时间", "AI",
-                         "12", "8", "可能还有遗漏", "配图2张", "1 / 2", "2 / 2"):
+                         "12", "8", "可能还有遗漏", "配图2张", "1 / 1"):
             self.assertIn(expected, text)
         for i in range(1, 9):
             self.assertEqual(text.count(f"DEMO-{i:03}"), 1)
@@ -140,7 +406,7 @@ class CardsTests(unittest.TestCase):
                 # Pixel assertions use real Pillow glyph bounds at render scale.
                 # The image counter also needs room for its 20px icon.
                 gap = 30 if right_label.startswith("配图") else 16
-                self.assertLessEqual(left[2] + gap * 2, right[0])
+                self.assertLessEqual(left[2] + gap, right[0])
         with Image.open(paths[0]) as rendered:
             self.assertEqual(rendered.width, 1080)
             self.assertLessEqual(rendered.height, 2400)
@@ -154,13 +420,13 @@ class CardsTests(unittest.TestCase):
                     self.cards.render_digest(digest, self.temp.name)
         self.assertFalse(list(Path(self.temp.name).iterdir()))
 
-    def test_duplicate_excerpt_summary_is_drawn_once_without_placeholder(self):
+    def test_duplicate_title_is_omitted_and_original_body_is_drawn_once(self):
         sentence = "合成示例里的小动物真可爱"
         digest = fixture(1, mode="excerpt")
         digest["items"][0]["title"] = sentence
         for summary in (sentence, f" \t{sentence[:4]}　{sentence[4:]} 。！？ ", sentence + "..."):
             with self.subTest(summary=summary):
-                digest["items"][0]["summary"] = summary
+                digest["items"][0].update(body=summary, summary="AI摘要不能替代原文")
                 positions = []
                 paths, text = self.render_with_text(digest, positions)
                 with Image.open(paths[0]) as rendered:
@@ -168,17 +434,25 @@ class CardsTests(unittest.TestCase):
                 matching_draws = [label for label, _ in positions
                                   if "".join(label.split()).rstrip("。！？.!?") == sentence]
                 self.assertEqual(len(matching_draws), 1)
+                body_box = next(box for label, box in positions if label in matching_draws)
+                self.assertLess(body_box[3] - body_box[1], 30, "Body uses 26px, not the 32px title")
+                self.assertNotIn("AI摘要不能替代原文", text)
                 self.assertNotIn("请查看原帖了解详情", text)
-        digest["items"][0]["summary"] = "另一句合成说明"
+        digest["items"][0]["body"] = "另一句合成说明"
         paths, text = self.render_with_text(digest)
         self.assertIn("另一句合成说明", text)
         with Image.open(paths[0]) as rendered:
             self.assertGreater(rendered.height, compact_height)
         # A title clamped to two lines must not hide the longer summary's detail.
         long_text = "合成测试。" * 14 + "摘要里保留的细节"
-        digest["items"][0].update(title=long_text, summary=long_text)
+        digest["items"][0].update(title=long_text[:20] + "…", body=long_text)
         _, text = self.render_with_text(digest)
         self.assertIn("摘要里保留的细节", text)
+        for title in ("第一段原文", "第一段原文…", "第一段原文..."):
+            digest["items"][0].update(title=title, body="第一段原文\n第二段保留更多内容")
+            _, text = self.render_with_text(digest)
+            self.assertEqual(text.count("第一段原文"), 1)
+            self.assertIn("第二段保留更多内容", text)
 
     def color_region(self, image, color):
         """Locate source-image pixels with tolerance for JPEG/resampling noise."""
@@ -190,9 +464,9 @@ class CardsTests(unittest.TestCase):
 
     def test_cached_thumbnail_pixels_preserve_all_corners_and_aspect_ratio(self):
         colors = ((204, 14, 157), (17, 191, 70), (242, 208, 10), (11, 211, 213))
-        for width, height, displayed in ((1024, 2048, (94, 188)),
-                                          (2048, 1024, (212, 106)),
-                                          (160, 160, (188, 188))):
+        for width, height, displayed in ((1024, 2048, (170, 340)),
+                                          (2048, 1024, (680, 340)),
+                                          (160, 160, (340, 340))):
             with self.subTest(size=(width, height)):
                 photo = Path(self.temp.name) / "synthetic-corners.jpg"
                 with Image.new("RGB", (width, height)) as source:
@@ -223,11 +497,10 @@ class CardsTests(unittest.TestCase):
                         boxes.append(box)
                     left, top = min(b[0] for b in boxes), min(b[1] for b in boxes)
                     right, bottom = max(b[2] for b in boxes), max(b[3] for b in boxes)
-                    self.assertGreater(left, 700, "Thumbnail belongs beside the text")
+                    self.assertGreater(left, 80)
                     self.assertLess(right, 1000)
                     self.assertAlmostEqual((right - left) / (bottom - top), width / height, delta=0.05)
-                    # Small cache images must fill the padded frame too, after
-                    # the 2x canvas is reduced to the saved PNG's logical pixels.
+                    # Small cache images fill the padded gallery frame too.
                     self.assertAlmostEqual(right - left, displayed[0], delta=2)
                     self.assertAlmostEqual(bottom - top, displayed[1], delta=2)
 
@@ -258,16 +531,14 @@ class CardsTests(unittest.TestCase):
                 _, text = self.render_with_text(fixture(2, mode=mode))
                 for banned in ("未经核实", "图片未识别", "附图未识别"):
                     self.assertNotIn(banned, text)
-                self.assertIn("/校园圈 详情", text)
-                self.assertIn("/校园圈 图片", text)
+                self.assertIn("/校园墙 详情", text)
+                self.assertIn("/校园墙 图片", text)
                 self.assertIn("原帖 #DEMO-001", text)
 
     def test_fifth_post_survives_pagination_boundary(self):
         paths, text = self.render_with_text(fixture(5))
-        self.assertEqual(len(paths), 2)
+        self.assertEqual(len(paths), 1)
         self.assertEqual(text.count("DEMO-005"), 1)
-        with Image.open(paths[0]) as first, Image.open(paths[1]) as second:
-            self.assertGreater(first.height, second.height)
 
     def test_shown_selects_only_the_requested_items(self):
         paths, text = self.render_with_text(fixture(4, shown=2))
@@ -296,36 +567,148 @@ class CardsTests(unittest.TestCase):
         self.assertTrue(all(font.getlength(line) <= 310 for line in lines))
         self.assertEqual(lines, self.cards._wrap("很长的内容。" * 2000, font, 310, 3))
 
-    def test_worst_case_layout_has_no_off_canvas_text_and_caps_eight_items(self):
-        digest = fixture(11, scan_limited=True, intro="很长的介绍，" * 3000,
-                         community="很长的校园墙名称" * 3000)
-        colors = [(90 + i * 20, 12, 170) for i in range(8)]
-        for i, item in enumerate(digest["items"]):
-            photo = Path(self.temp.name) / f"synthetic-{i}.jpg"
-            with Image.new("RGB", (2048, 1536), colors[i % 8]) as source:
-                source.save(photo, quality=95, subsampling=0)
-            item.update(title="长标题（中英文 Mixed）：" * 3000,
-                        summary=("超长段落👩‍🎓😀\n\n" + "Token" * 400) * 20,
-                        category="很长的分类名称" * 200, image_count=99,
-                        like_count=99_999_999, trace_count=10 ** 100, comment_count=999,
-                        image_path=photo)
-        paths, text = self.render_with_text(digest)
-        self.assertEqual(len(paths), 2)
+    def test_original_body_after_three_lines_and_paragraphs_survives(self):
+        digest = fixture(1)
+        body = "合成原文段落。" * 90 + "\n\n正文末行仍可见"
+        self.assertLessEqual(len(body), 720)
+        digest["items"][0].update(body=body, summary="摘要不能代替正文", truncated=True)
+        positions = []
+        paths, text = self.render_with_text(digest, positions)
+        self.assertIn("正文末行仍可见", text)
+        self.assertIn("原文节选", text)
+        self.assertNotIn("摘要不能代替正文", text)
+        paragraphs = [box for label, box in positions if "合成原文" in label]
+        final = next(box for label, box in positions if label == "正文末行仍可见")
+        self.assertGreater(len(paragraphs), 3)
+        self.assertGreater(final[1] - paragraphs[-1][1], 39)
+        with Image.open(paths[0]) as rendered:
+            self.assertLessEqual(rendered.height, 16000)
+
+    def test_top_ten_plan_is_pure_and_renders_exactly_one_png_in_rank_order(self):
+        digest = fixture(15, ranking="likes", total=369)
+        before = copy.deepcopy(digest)
+        with patch.object(Image, "open", side_effect=AssertionError("planner decoded a photo")):
+            plan = self.cards.plan_digest(digest)
+        self.assertEqual(digest, before)
+        self.assertEqual(plan, {"pages": [list(range(10))], "shown": 10, "omitted": 5})
+        self.assertFalse(list(Path(self.temp.name).iterdir()))
+        paths, text = self.render_with_text(digest, plan=plan)
+        self.assertEqual(len(paths), 1)
+        for i in range(10):
+            self.assertEqual(text.count(f"原帖 #DEMO-{i + 1:03}"), 1)
+        self.assertNotIn("DEMO-011", text)
+        self.assertLess(text.index("DEMO-009"), text.index("DEMO-010"))
+        self.assertIn("已展示 10 条入选帖 · 未展示 359 条", text)
+        self.assertNotIn("未展示 0 条", text)
         for page, path in enumerate(paths):
-            with Image.open(path) as im:
-                self.assertEqual(im.width, 1080)
-                self.assertLessEqual(im.height, 2400)
-                for i, color in enumerate(colors):
-                    _, pixels = self.color_region(im, color)
-                    if page * 4 <= i < (page + 1) * 4:
-                        self.assertGreater(pixels, 1000, f"Missing thumbnail for item {i + 1}")
-                    else:
-                        self.assertEqual(pixels, 0, "Only four thumbnails belong on each page")
-        self.assertIn("…", text)
-        self.assertNotIn("DEMO-009", text)
-        self.assertIn("DEMO-008", text)
-        self.assertNotIn("😀", text)
-        self.assertNotIn("\u200d", text)
+            with Image.open(path) as rendered:
+                self.assertEqual(rendered.width, 1080)
+                self.assertLessEqual(rendered.height, 16000)
+            self.assertIn(f"{page + 1} / {len(paths)}", text)
+
+    def test_ten_long_bodies_with_galleries_are_bounded_and_decode_one_post_at_a_time(self):
+        digest = fixture(13, ranking="likes", scan_limited=True, intro="长导语" * 200)
+        photo = Path(self.temp.name) / "long-gallery.jpg"
+        with Image.new("RGB", (160, 160), "#CC0E9D") as source:
+            source.save(photo)
+        for item in digest["items"]:
+            item.update(title="短标题", body="原文" * 990 + "完整原文末尾", image_count=3, gallery_count=3)
+        plan = self.cards.plan_digest(digest)
+        self.assertEqual(plan, {"pages": [list(range(10))], "shown": 10, "omitted": 3})
+        digest["items"] = digest["items"][:plan["shown"]]
+        digest["omitted"] = 3
+        # Keep the old digest.shown intentionally: the supplied plan owns selection.
+        for item in digest["items"]:
+            item.update(title="很长的新AI标题" * 60, image_paths=[str(photo)] * 3)
+        loaded, allocations = [], []
+        original_load, original_new = self.cards._load_thumbnail, Image.new
+
+        def load_current_post(*args):
+            if loaded and len(loaded) % 3 == 0:
+                for previous in loaded[-3:]:
+                    with self.assertRaises(ValueError):
+                        previous.getpixel((0, 0))
+            image = original_load(*args)
+            loaded.append(image)
+            return image
+
+        def track_allocation(mode, size, *args, **kwargs):
+            allocations.append(size)
+            return original_new(mode, size, *args, **kwargs)
+
+        with patch.object(self.cards, "_load_thumbnail", load_current_post), patch.object(Image, "new", track_allocation):
+            paths, text = self.render_with_text(digest, plan=plan)
+        self.assertEqual(len(loaded), 30)
+        self.assertTrue(all(width <= 1080 and height <= 16000 for width, height in allocations))
+        for previous in loaded:
+            with self.assertRaises(ValueError):
+                previous.getpixel((0, 0))
+        self.assertEqual(len(paths), 1)
+        self.assertIn("已展示 10 条入选帖 · 未展示 3 条", text)
+        self.assertEqual(text.count("原文节选"), 10)
+        self.assertNotIn("完整原文末尾", text)
+        self.assertNotIn("DEMO-011", text)
+        for path in paths:
+            with Image.open(path) as rendered:
+                self.assertLessEqual(rendered.height, 16000)
+                self.assertGreater(rendered.height, 14000)
+
+    def test_disabled_gallery_low_counts_and_extreme_paragraphs(self):
+        digest = fixture(2)
+        for item in digest["items"]:
+            item.update(image_count=99, gallery_count=0)
+            item["image_paths"] = ["disabled.jpg"] * 3
+        with patch.object(self.cards, "_load_thumbnail", side_effect=AssertionError("disabled gallery decoded")):
+            paths, _ = self.render_with_text(digest)
+        self.assertEqual(len(paths), 1)
+        for count in range(4):
+            plan = self.cards.plan_digest(fixture(count))
+            self.assertEqual(len(plan["pages"]), 1 if count else 0)
+            self.assertEqual(plan["shown"], count)
+        huge = fixture(1)
+        huge["items"][0]["body"] = "字\n" * 1000
+        paths, text = self.render_with_text(huge)
+        self.assertEqual(len(paths), 1)
+        self.assertIn("原文节选", text)
+
+    def test_two_and_three_photo_galleries_keep_corners_below_full_width_body(self):
+        paths, palettes = [], []
+        for i, (width, height) in enumerate(((320, 640), (640, 320), (160, 160))):
+            palette = ((170 + i * 25, 15, 145), (15, 160 + i * 25, 45),
+                       (230, 170 + i * 25, 15), (15, 170 + i * 25, 220))
+            palettes.append(palette)
+            path = Path(self.temp.name) / f"gallery-{i}.jpg"
+            with Image.new("RGB", (width, height), "#ECEFF2") as source:
+                draw = ImageDraw.Draw(source)
+                for box, color in zip(((0, 0, width // 4, height // 4),
+                                       (3 * width // 4, 0, width - 1, height // 4),
+                                       (0, 3 * height // 4, width // 4, height - 1),
+                                       (3 * width // 4, 3 * height // 4, width - 1, height - 1)), palette):
+                    draw.rectangle(box, fill=color)
+                source.save(path, quality=95, subsampling=0)
+            paths.append(str(path))
+        for count in (2, 3):
+            with self.subTest(count=count):
+                digest = fixture(1)
+                digest["items"][0].update(body="全宽原文" * 10 + "\n正文终点", image_count=5,
+                                          gallery_count=count, image_paths=paths[:count])
+                positions = []
+                outputs, text = self.render_with_text(digest, positions)
+                body_bottom = next(box[3] for label, box in positions if label == "正文终点")
+                self.assertIn("全宽原文" * 8, text)
+                with Image.open(outputs[0]) as rendered:
+                    for palette in palettes[:count]:
+                        for color in palette:
+                            box, pixels = self.color_region(rendered, color)
+                            self.assertGreater(pixels, 100)
+                            self.assertGreater(box[1], body_bottom)
+
+    def test_supplied_plan_rejects_nonprefix_indices_before_creating_files(self):
+        for pages in ([[1]], [[0], [2]], [[0], []], [[0, 0]], [[True]]):
+            plan = {"pages": pages, "shown": sum(map(len, pages)), "omitted": 0}
+            with self.subTest(pages=pages), self.assertRaises(self.cards.RenderError):
+                self.cards.render_digest(fixture(3), self.temp.name, plan=plan)
+        self.assertFalse(list(Path(self.temp.name).iterdir()))
 
     def test_excerpt_mode_and_cross_midnight_window(self):
         paths, text = self.render_with_text(fixture(
@@ -413,17 +796,11 @@ class CardsTests(unittest.TestCase):
 
     def test_write_failure_is_wrapped_and_only_this_batch_is_cleaned_up(self):
         existing = self.cards.render_digest(fixture(1), self.temp.name)[0]
-        original = Image.Image.save
-        calls = 0
+        def fail_save(image, fp, *args, **kwargs):
+            Path(fp).write_bytes(b"partial PNG")
+            raise OSError("synthetic disk failure")
 
-        def fail_second(image, fp, *args, **kwargs):
-            nonlocal calls
-            calls += 1
-            if calls == 2:
-                raise OSError("synthetic disk failure")
-            return original(image, fp, *args, **kwargs)
-
-        with patch.object(Image.Image, "save", fail_second):
+        with patch.object(Image.Image, "save", fail_save):
             with self.assertRaises(self.cards.RenderError):
                 self.cards.render_digest(fixture(8), self.temp.name)
         self.assertEqual(list(Path(self.temp.name).iterdir()), [Path(existing)])

@@ -24,12 +24,12 @@ from cards import _Fonts, render_digest
 
 def demo_digest():
     """All IDs, posts, dates and counts below are synthetic demonstration data."""
-    return {
+    digest = {
         "community": "民大校园墙  /  合成示例 · 非真实投稿",
         "window_start": "2026-11-12T12:00:00+08:00",
         "window_end": "2026-11-12T16:00:00+08:00",
-        "total": 12,
-        "shown": 4,
+        "total": 16,
+        "shown": 10,
         "scan_limited": False,
         "mode": "ai",
         "ranking": "likes",
@@ -73,6 +73,29 @@ def demo_digest():
             },
         ],
     }
+    digest["items"][0].update(
+        title="用三张插画，记录校园生活的片段",
+        body="今天画了三张合成插画：一只帆布袋、一页读书清单，还有秋天的校园。所有图片都是程序绘制的示意图，不是真实照片。\n\n"
+             "第一张练习用简单线条表现物品，第二张试着整理读书清单，第三张把暖色屋顶与树叶放在一起。\n\n"
+             "想继续画一些日常的小场景。先把这些练习收在一起，看看以后会有什么新想法。")
+    extra = (
+        ("社团开放日的合成记录", "活动交流", "这是一份虚构的社团开放日记录。想试试画画、读书和摄影的小活动。\n\n先从喜欢的项目开始，慢慢找到愿意坚持的事情。"),
+        ("今天也想分享一本好书", "读书交流", "最近在读一本虚构的自然笔记，里面记录了很多观察植物的小方法。\n\n我打算准备一个小本子，把散步看到的叶子画下来。"),
+        ("整理笔记，让复习轻松一点", "学习分享", "把课堂笔记重新分了目录，还给不熟悉的部分做了标记。\n\n这些文字只是合成排版示例，不包含真实课程信息。"),
+        ("秋天的晚风很舒服", "校园日常", "秋天的晚风很舒服"),
+        ("一起记录校园的颜色", "摄影交流", "想记录一天里校园颜色的变化：午后的树影、傍晚的天空、夜里亮起的灯。\n\n这里的配图都是合成示意图，欢迎把它当作一个小小的创作练习。"),
+        ("给忙碌的一天留一点空白", "校园日常", "今天给自己留了一段没有计划的时间，散步、听歌，慢慢整理思绪。\n\n这条合成帖子用来展示长图最后一条内容和来源信息。"),
+    )
+    for index, (title, category, body) in enumerate(extra, 5):
+        digest["items"].append(dict(
+            id=f"DEMO-{index:03}", title=title, category=category, body=body,
+            summary="合成摘要，不替代原文。", published_at="2026-11-12T15:50:00+08:00",
+            image_count=0, like_count=52 - index * 4, trace_count=15 - index, comment_count=index % 4))
+    for item, count in zip(digest["items"], (3, 1, 2, 3, 0, 2, 1, 0, 3, 1)):
+        item.setdefault("body", item["summary"])
+        item["gallery_count"] = count
+        item["image_count"] = count + (1 if count == 3 else 0)
+    return digest
 
 
 def synthetic_images(directory, font_path=""):
@@ -141,9 +164,10 @@ def main():
     with tempfile.TemporaryDirectory(prefix="campus-card-preview-") as scratch:
         photos = synthetic_images(scratch, args.font)
         digest = demo_digest()
-        for item in digest["items"]:
-            if item["id"] in photos:
-                item["image_path"] = photos[item["id"]]
+        samples = list(photos.values())
+        for index, item in enumerate(digest["items"]):
+            item["image_paths"] = [samples[(index + offset) % 3]
+                                   for offset in range(item["gallery_count"])]
         pages = render_digest(digest, scratch, args.font)
         output.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(pages[0], output)

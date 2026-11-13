@@ -3,12 +3,15 @@
 Authentication is supplied by the operator; no login emulation or account writes.
 """
 import asyncio
+import base64
 import copy
 import contextvars
 import html
+import io
 import logging
 import re
 import time
+import warnings
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
@@ -21,9 +24,17 @@ except ImportError:
     from media import safe_image_urls
 
 BASE = 'https://ys.qimiaoyuanfen.com'
+# Target Applet cache identity; release 159's onShareAppMessage uses this path.
+# These identify a mini-program page, not a fabricated public/browser URL.
+MINI_APP_ID = 'wxe23b94e06f71e89a'
+MINI_APP_DETAIL_PATH = '/pages/post/detail/detail'
+_QR_ROUTE = '/article/article/getxcxcode'
+_QR_MAX_BYTES = 256 * 1024
+_QR_MAX_PIXELS = 1_000_000
 ROUTES = frozenset({
     '/base/community/lists', '/article/article/lists', '/article/article/dayhot',
     '/article/article/checkauth', '/article/article/search', '/article/article/info',
+    _QR_ROUTE,
 })
 _BEIJING = timezone(timedelta(hours=8))
 _FEED_CEILING = 2000  # The service reports at most this many visible feed rows.
@@ -116,6 +127,51 @@ def _published_time(value):
         return None
 
 
+def _sanitize_qr(value):
+    """Sniff inline PNG/JPEG bytes and return a clean JPEG; never fetch a URL.
+
+    Called in a worker, with byte/pixel bounds checked before full decoding.
+    Pillow is optional: an unavailable decoder simply omits the QR attachment.
+    """
+    if not isinstance(value, str) or len(value) > 23 + ((_QR_MAX_BYTES + 2) // 3) * 4:
+        return None
+    header, separator, encoded = value.partition(',')
+    if not separator or header not in ('data:image/jpeg;base64', 'data:image/jpg;base64',
+                                       'data:image/png;base64'):
+        return None
+    try:
+        from PIL import Image, ImageOps
+
+        binary = base64.b64decode(encoded, validate=True)
+        if not binary or len(binary) > _QR_MAX_BYTES:
+            return None
+        with warnings.catch_warnings():
+            warnings.simplefilter('error', Image.DecompressionBombWarning)
+            # Some responses may mislabel the MIME type; trust the decoder's
+            # PNG/JPEG identification, never the declared type alone.
+            with Image.open(io.BytesIO(binary), formats=['JPEG', 'PNG']) as image:
+                width, height = image.size
+                if width < 1 or height < 1 or width * height > _QR_MAX_PIXELS:
+                    return None
+                image.verify()
+            with Image.open(io.BytesIO(binary), formats=['JPEG', 'PNG']) as image:
+                image.load()
+                with ImageOps.exif_transpose(image) as oriented, oriented.convert('RGBA') as normalized:
+                    # Fresh white backing strips metadata and keeps transparent
+                    # PNG QR backgrounds readable. Close every decoded copy.
+                    with Image.new('RGB', normalized.size, 'white') as clean, normalized.getchannel('A') as alpha:
+                        clean.paste(normalized, mask=alpha)
+                        with io.BytesIO() as output:
+                            clean.save(output, format='JPEG', quality=95, subsampling=0)
+                            binary = output.getvalue()
+        if len(binary) > _QR_MAX_BYTES:
+            return None
+        return 'data:image/jpeg;base64,' + base64.b64encode(binary).decode('ascii')
+    except Exception:
+        # Optional media failures must not expose payloads or exception messages.
+        return None
+
+
 class CampusClient:
     def __init__(self, cookie, *, school='中央民族大学', community='民大校园墙',
                  community_id='', cache_ttl=60, transport=None, clock=time.monotonic):
@@ -143,7 +199,7 @@ class CampusClient:
         await self.http.aclose()
         self.cache.clear()
 
-    async def _post(self, path, data):
+    async def _post(self, path, data, *, invalidate_login=True):
         if path not in ROUTES:
             raise CampusError('invalid_action', '不支持此操作')
         if not self.cookie or '\r' in self.cookie or '\n' in self.cookie:
@@ -154,8 +210,9 @@ class CampusClient:
         try:
             async with self.http.stream('POST', path, json=data, headers={'Cookie': self.cookie}) as response:
                 if response.status_code in (401, 403):
-                    self.expired = True
-                    self.cache.clear()
+                    if invalidate_login:
+                        self.expired = True
+                        self.cache.clear()
                     raise CampusError('login_expired', '校园圈登录失效或访问被拒绝')
                 if response.status_code != 200:
                     raise CampusError('upstream_error', f'校园圈服务请求失败（HTTP {response.status_code}），不能据此判断没有帖子')
@@ -176,8 +233,9 @@ class CampusClient:
             raise CampusError('invalid_response', '校园圈响应格式发生变化')
         code = str(payload.get('code', ''))
         if code == '7001':
-            self.expired = True
-            self.cache.clear()
+            if invalidate_login:
+                self.expired = True
+                self.cache.clear()
             raise CampusError('login_expired', '校园圈登录已失效；需要更新 Cookie 并重载插件')
         if code != '0000':
             # Do not echo arbitrary upstream messages (which could contain credentials).
@@ -186,6 +244,19 @@ class CampusClient:
         if not isinstance(data, dict):
             raise CampusError('invalid_response', '校园圈响应缺少预期的数据对象')
         return data
+
+    async def _post_qr(self, post_id):
+        # Release 159 generatePoster requests this read-only endpoint. QR-only
+        # denial must not expire a working detail session: the final _scope
+        # check still independently enforces login and community membership.
+        try:
+            data = await asyncio.wait_for(
+                self._post(_QR_ROUTE, {'article_id': post_id}, invalidate_login=False),
+                timeout=5.0,
+            )
+        except (CampusError, TimeoutError):
+            return None
+        return await asyncio.to_thread(_sanitize_qr, data.get('xcxCode'))
 
     async def _scope(self):
         data = await self._post('/base/community/lists', {})
@@ -205,7 +276,9 @@ class CampusClient:
         if (row_cid and row_cid != cid) or (detail and not row_cid):
             raise CampusError('community_mismatch', '帖子的校园归属无法确认，已停止读取')
         text = clean_text(raw.get('detail', ''))
-        cap = body_limit if body_limit is not None else (2400 if detail else 600)
+        # Detail already sits behind _post's 1 MiB response limit. Keep all
+        # sanitized source text there; lists and window snapshots stay bounded.
+        cap = body_limit if body_limit is not None else (None if detail else 600)
         images = raw.get('show_images')
         if not isinstance(images, list):
             images = [s for s in str(raw.get('images') or '').split(',') if s]
@@ -222,8 +295,9 @@ class CampusClient:
             thumbnails.append(safe_image_urls(choices)[0])
             if len(originals) == 9:
                 break
-        return {
-            'id': str(raw['id']), 'text': text[:cap], 'truncated': len(text) > cap,
+        view = {
+            'id': str(raw['id']), 'text': text if cap is None else text[:cap],
+            'truncated': cap is not None and len(text) > cap,
             'published_at': clean_text(raw.get('create_time', ''))[:80] or '原文未提供时间',
             'category': clean_text(raw.get('category_name', ''))[:60],
             'image_count': len(images),
@@ -234,6 +308,10 @@ class CampusClient:
             'thumbnail_urls': thumbnails,
             'source': f'云上校友圈 → {self.community} → 帖子 {raw["id"]}',
         }
+        if detail:
+            view.update(mini_app_path=f'{MINI_APP_DETAIL_PATH}?id={view["id"]}',
+                        mini_app_id=MINI_APP_ID)
+        return view
 
     async def fetch_window(self, start: datetime, end: datetime, *, max_pages=100, page_size=20) -> dict:
         """Collect unique posts in [start, end), newest first, without caching.
@@ -356,7 +434,13 @@ class CampusClient:
             return out
         if action == 'detail':
             raw = await self._post('/article/article/info', {'from_type': 1, 'id': post_id})
-            posts = [self._post_view(raw, cid, detail=True)]
+            post = self._post_view(raw, cid, detail=True)
+            if post['id'] != post_id:
+                raise CampusError('invalid_response', '详情返回的帖子ID与请求不一致')
+            qr = await self._post_qr(post_id)
+            if qr is not None:
+                post['mini_app_qr_data_url'] = qr
+            posts = [post]
         else:
             path = {'latest': '/article/article/lists', 'hot': '/article/article/dayhot', 'search': '/article/article/search'}[action]
             params = {'page': 1, 'pageSize': limit}
