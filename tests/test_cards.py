@@ -71,12 +71,13 @@ class CardsTests(unittest.TestCase):
                 self.assertLessEqual(im.height, 2400)
                 self.assertGreater(im.height, 1000)
             self.assertLess(Path(path).stat().st_size, 2_000_000)
-        for expected in ("同学投稿 · 非官方", "12:00", "16:00", "北京时间", "AI",
+        for expected in ("本期展示", "12:00", "16:00", "北京时间", "AI",
                          "12", "8", "扫描未完成", "图片未识别", "1 / 2", "2 / 2"):
             self.assertIn(expected, text)
         for i in range(1, 9):
             self.assertEqual(text.count(f"DEMO-{i:03}"), 1)
         self.assertEqual(text.count("寻找周末一起读书的同学"), 8)
+        self.assertNotIn("非官方", text)
 
     def test_fifth_post_survives_pagination_boundary(self):
         paths, text = self.render_with_text(fixture(5))
@@ -88,7 +89,7 @@ class CardsTests(unittest.TestCase):
     def test_shown_selects_only_the_requested_items(self):
         paths, text = self.render_with_text(fixture(4, shown=2))
         self.assertEqual(len(paths), 1)
-        self.assertIn("展示 2", text)
+        self.assertIn("本期展示", text)
         self.assertIn("DEMO-002", text)
         self.assertNotIn("DEMO-003", text)
 
@@ -126,7 +127,7 @@ class CardsTests(unittest.TestCase):
                 self.assertLessEqual(im.height, 2400)
         self.assertIn("…", text)
         self.assertNotIn("DEMO-009", text)
-        self.assertIn("展示 8", text)
+        self.assertIn("DEMO-008", text)
         self.assertNotIn("😀", text)
         self.assertNotIn("\u200d", text)
 
@@ -141,15 +142,25 @@ class CardsTests(unittest.TestCase):
 
     def test_interval_labels_follow_six_and_twenty_four_hour_windows(self):
         for end, masthead, footer in (
-            ("2026-11-12T10:00:00+00:00", "C A M P U S   /   0 6 H", "每 6 小时一辑"),
-            ("2026-11-13T04:00:00+00:00", "C A M P U S   /   2 4 H", "每 24 小时一辑"),
+            ("2026-11-12T10:00:00+00:00", "CAMPUS DIGEST·每 6 小时", "每 6 小时一辑"),
+            ("2026-11-13T04:00:00+00:00", "CAMPUS DIGEST·每 24 小时", "每 24 小时一辑"),
         ):
             with self.subTest(end=end):
                 _, text = self.render_with_text(fixture(1, window_end=end))
                 self.assertIn(masthead, text)
                 self.assertIn(footer, text)
-                self.assertNotIn("0 4 H", text)
                 self.assertNotIn("每 4 小时", text)
+
+    def test_collections_use_the_simplified_chinese_face_and_a_bold_weight(self):
+        regular, bold = self.fonts.get(28), self.fonts.get(28, bold=True)
+        if self.fonts.path.endswith("NotoSansCJK-Regular.ttc"):
+            self.assertEqual(regular.getname(), ("Noto Sans CJK SC", "Regular"))
+            self.assertEqual(bold.getname(), ("Noto Sans CJK SC", "Bold"))
+        self.assertIsNot(regular, bold)
+
+    def test_category_colors_are_stable_and_semantic(self):
+        self.assertEqual(self.cards._tag_color("失物招领"), self.cards._TAGS["orange"])
+        self.assertEqual(self.cards._tag_color("某个新分类"), self.cards._tag_color("某个新分类"))
 
     def test_invalid_or_non_cjk_explicit_font_fails_without_fallback(self):
         with self.assertRaises(self.cards.RenderError):
