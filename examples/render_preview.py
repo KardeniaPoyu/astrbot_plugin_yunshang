@@ -32,7 +32,8 @@ def demo_digest():
         "shown": 4,
         "scan_limited": False,
         "mode": "ai",
-        "intro": "有人寻找一起自习的伙伴，有人分享读过的好书。\n这四小时里，校园生活又添了几笔温暖的注脚。",
+        "ranking": "likes",
+        "intro": "这四小时，大家关注的学习、失物与校园日常。",
         "items": [
             {
                 "id": "DEMO-001",
@@ -41,6 +42,7 @@ def demo_digest():
                 "published_at": "2026-11-12T12:26:00+08:00",
                 "category": "学习搭子",
                 "image_count": 0,
+                "like_count": 128, "trace_count": 23, "comment_count": 18,
             },
             {
                 "id": "DEMO-002",
@@ -49,6 +51,7 @@ def demo_digest():
                 "published_at": "2026-11-12T13:08:00+08:00",
                 "category": "失物招领",
                 "image_count": 2,
+                "like_count": 96, "trace_count": 12, "comment_count": 7,
             },
             {
                 "id": "DEMO-003",
@@ -57,6 +60,7 @@ def demo_digest():
                 "published_at": "2026-11-12T14:17:00+08:00",
                 "category": "旧书交换",
                 "image_count": 3,
+                "like_count": 74, "trace_count": 19, "comment_count": 11,
             },
             {
                 "id": "DEMO-004",
@@ -65,6 +69,7 @@ def demo_digest():
                 "published_at": "2026-11-12T15:42:00+08:00",
                 "category": "校园日常",
                 "image_count": 1,
+                "like_count": 52, "trace_count": 8, "comment_count": 5,
             },
         ],
     }

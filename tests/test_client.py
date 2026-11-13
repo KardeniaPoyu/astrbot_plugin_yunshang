@@ -61,6 +61,19 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await c.close()
 
+    async def test_engagement_counts_match_api_fields(self):
+        self.posts=[{**POST,'count_star':'123','count_trace':7,'count_comment':'0',
+                     'hot':9999,'has_star':1,'has_trace':1}]
+        post=(await self.client.query())['posts'][0]
+        self.assertEqual((post['like_count'],post['trace_count'],post['comment_count']),(123,7,0))
+
+    async def test_missing_or_invalid_engagement_is_unknown_not_invented_zero(self):
+        for value in (None,True,-1,'-2','NaN',2.5,{},'9999999999999999999999999'):
+            with self.subTest(value=value):
+                raw={**POST,'count_star':value,'count_trace':value,'count_comment':value}
+                post=self.client._post_view(raw,'37')
+                self.assertEqual((post['like_count'],post['trace_count'],post['comment_count']),(None,None,None))
+
     async def test_post_pictures_keep_cdn_originals_and_thumbnails(self):
         base='https://ysxy.img.qimiaoyuanfen.com/'
         self.posts=[{**POST,'images':base+'first.jpg,'+base+'second.jpg',
@@ -348,7 +361,7 @@ class WindowTests(unittest.IsolatedAsyncioTestCase):
     async def test_all_duplicate_pages_reach_cap_without_claiming_complete(self):
         self.pages = {i: [self.post(1, '2019-01-01 00:00:00')] for i in range(1, 11)}
         self.total = 2
-        out = await self.client.fetch_window(self.start, self.end)
+        out = await self.client.fetch_window(self.start, self.end, max_pages=10)
         self.assertEqual(out['posts'], [])
         self.assertEqual(out['scanned'], 10)
         self.assertTrue(out['scan_limited'])
@@ -387,6 +400,14 @@ class WindowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out['invalid_dates'], 0)
         self.assertTrue(out['scan_limited'])
 
+    async def test_posts_arriving_after_snapshot_end_do_not_make_closed_window_partial(self):
+        newer=(datetime.now(timezone.utc)+timedelta(seconds=2)).astimezone(BEIJING)
+        self.pages={1:[self.post(2,newer.isoformat()),self.post(1)]}
+        self.total=2
+        out=await self.client.fetch_window(self.start,self.end)
+        self.assertEqual([p['id'] for p in out['posts']],['1'])
+        self.assertFalse(out['scan_limited'])
+
     async def test_empty_feed_is_complete(self):
         out = await self.client.fetch_window(self.start, self.end)
         self.assertEqual(out, {'posts': [], 'total': 0, 'scanned': 0,
@@ -420,13 +441,30 @@ class WindowTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(out['total'], 2)
                 self.assertEqual(len(self.feed_bodies()), 2)
 
-    async def test_default_scan_is_bounded_to_200_rows(self):
+    async def test_explicit_small_scan_is_bounded_to_200_rows(self):
         self.pages = {i: [self.post(i * 20 + j) for j in range(20)] for i in range(1, 12)}
-        out = await self.client.fetch_window(self.start, self.end)
+        out = await self.client.fetch_window(self.start, self.end, max_pages=10)
         self.assertEqual(out['scanned'], 200)
         self.assertEqual(out['total'], 200)
         self.assertTrue(out['scan_limited'])
         self.assertEqual(len(self.feed_bodies()), 10)
+
+    async def test_busy_four_hour_window_scans_past_old_200_row_limit(self):
+        self.pages={i:[self.post(i*20+j) for j in range(20)] for i in range(1,31)}
+        self.pages[31]=[self.post(9999,'2020-01-02 07:59:59')]
+        self.total=2000
+        out=await self.client.fetch_window(self.start,self.end)
+        self.assertEqual(out['total'],600)
+        self.assertEqual(len(self.feed_bodies()),31)
+        self.assertFalse(out['scan_limited'])
+
+    async def test_2000_item_feed_ceiling_cannot_prove_full_time_coverage(self):
+        self.pages={i:[self.post(i*20+j) for j in range(20)] for i in range(1,101)}
+        self.total=2000
+        out=await self.client.fetch_window(self.start,self.end)
+        self.assertEqual(out['total'],2000)
+        self.assertTrue(out['scan_limited'])
+        self.assertEqual(len(self.feed_bodies()),100)
 
     async def test_mid_fetch_login_failure_raises_without_partial_success(self):
         self.pages = {1: [self.post(1)], 2: httpx.Response(200, json={'code': '7001', 'data': []})}
@@ -486,7 +524,8 @@ class WindowTests(unittest.IsolatedAsyncioTestCase):
         out = await self.client.fetch_window(self.start, self.end)
         post = out['posts'][0]
         self.assertEqual(set(post), {'id', 'text', 'truncated', 'published_at',
-                                     'category', 'image_count', 'source', 'image_urls', 'thumbnail_urls'})
+                                     'category', 'image_count', 'source', 'image_urls', 'thumbnail_urls',
+                                     'like_count', 'trace_count', 'comment_count'})
         self.assertEqual(len(post['text']), 2000)
         self.assertTrue(post['truncated'])
         self.assertFalse(out['posts'][1]['truncated'])
@@ -519,7 +558,7 @@ class WindowTests(unittest.IsolatedAsyncioTestCase):
             (self.start, self.end.replace(tzinfo=None), {}),
             (self.end, self.start, {}), (self.start, self.start, {}),
         ]
-        for name, values in [('max_pages', [None, 0, -1, 11, 1.5, '2', True, float('inf')]),
+        for name, values in [('max_pages', [None, 0, -1, 101, 1.5, '2', True, float('inf')]),
                              ('page_size', [None, 0, -1, 21, 1.5, '2', True, float('inf')])]:
             invalid.extend((self.start, self.end, {name: value}) for value in values)
         for start, end, kwargs in invalid:

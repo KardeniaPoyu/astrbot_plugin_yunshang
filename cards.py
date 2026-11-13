@@ -297,6 +297,10 @@ def _validate(digest):
             raise RenderError("Every item requires a source post ID")
         if type(item["image_count"]) is not int or item["image_count"] < 0:
             raise RenderError("image_count must be a non-negative integer")
+        for key in ("like_count", "trace_count", "comment_count"):
+            count = item.get(key)
+            if count is not None and (type(count) is not int or count < 0):
+                raise RenderError(f"{key} must be a non-negative integer or None")
     return start, end, selected
 
 
@@ -340,6 +344,19 @@ def _load_thumbnail(image_path):
                 return thumbnail.resize(size, Image.LANCZOS)
     except (OSError, ValueError, TypeError, Image.DecompressionBombError):
         return None
+
+
+def _metric_count(count):
+    """Compact counts without rounding up or confusing unknown with zero."""
+    if count is None:
+        return "—"
+    if count < 10_000:
+        return str(count)
+    if count >= 99_900_000_000:
+        return "999亿+"
+    unit, suffix = (100_000_000, "亿") if count >= 100_000_000 else (10_000, "万")
+    whole, tenth = divmod(count * 10 // unit, 10)
+    return f"{whole}.{tenth}{suffix}" if tenth else f"{whole}{suffix}"
 
 
 class _Canvas:
@@ -430,21 +447,38 @@ class _Canvas:
 def _item_layout(item, canvas, start, number, thumbnail):
     clean = canvas.fonts.clean
     text_width = 920 - _THUMB_SIZE[0] - _THUMB_GAP if thumbnail is not None else 920
-    title = canvas.wrap(clean(item["title"], 320) or "同学分享", 32, text_width, 2, bold=True)
-    summary = canvas.wrap(clean(item["summary"]) or "请查看原帖了解详情。", 26, text_width, 3)
+    title_text, summary_text = clean(item["title"], 320), clean(item["summary"])
+    title = canvas.wrap(title_text or "同学分享", 32, text_width, 2, bold=True)
+    title_key = re.sub(r"\s+", "", title_text)
+    summary_key = re.sub(r"\s+", "", summary_text)
+    # Keep the summary when the displayed title has lost detail to truncation.
+    duplicate = (bool(title_key.rstrip("。！？.!?"))
+                 and title_key.rstrip("。！？.!?") == summary_key.rstrip("。！？.!?")
+                 and re.sub(r"\s+", "", "".join(title)) == title_key)
+    summary = [] if duplicate else canvas.wrap(summary_text or "请查看原帖了解详情。", 26, text_width, 3)
     category = canvas.wrap(clean(item["category"], 64).replace("\n", " ") or "校园日常", 19, 560, 1)[0]
-    source = canvas.wrap("原帖 #" + clean(item["id"], 128).replace("\n", " "), 20, 520, 1)[0]
     images = ""
     if item["image_count"]:
         count = str(item["image_count"]) if item["image_count"] < 1000 else "999+"
         images = f"配图{count}张"
+    metrics = f"点赞 {_metric_count(item.get('like_count'))} · 蹲蹲 {_metric_count(item.get('trace_count'))}"
+    # Reserve the image counter, its icon and a 24px gap before fitting metrics.
+    metrics_inset = canvas.length(images, 20) + 30 + 24 if images else 0
+    source_width = min(520, 920 - metrics_inset - canvas.length(metrics, 19) - 24)
+    source = canvas.wrap("原帖 #" + clean(item["id"], 128).replace("\n", " "),
+                         20, source_width, 1)[0]
+    if item.get("comment_count") is not None:
+        with_comments = metrics + f" · 评论 {_metric_count(item['comment_count'])}"
+        if canvas.length(with_comments, 19) <= 920 - metrics_inset - canvas.length(source, 20) - 24:
+            metrics = with_comments
     when = canvas.wrap(_published(item["published_at"], start), 20, 300, 1)[0]
     # The image shares the bounded title/summary block instead of adding a row.
-    body_height = max(44 * len(title) + 10 + 39 * len(summary),
+    body_height = max(44 * len(title) + (10 + 39 * len(summary) if summary else 0),
                       _THUMB_SIZE[1] if thumbnail is not None else 0)
     height = 28 + 32 + 18 + body_height + 18 + 16 + 24 + 24
     return dict(title=title, summary=summary, category=category, source=source,
                 images=images, when=when, height=height, number=number,
+                metrics=metrics, metrics_inset=metrics_inset,
                 colors=_tag_color(category), thumbnail=thumbnail, body_height=body_height)
 
 
@@ -466,7 +500,7 @@ def _draw_item(canvas, item, y):
     for line in item["title"]:
         canvas.text((left, row), line, 32, _TEXT, bold=True)
         row += 44
-    row += 10
+    row += 10 if item["summary"] else 0
     for line in item["summary"]:
         canvas.text((left, row), line, 26, _TEXT_2)
         row += 39
@@ -474,6 +508,7 @@ def _draw_item(canvas, item, y):
     canvas.line(((left, row), (right, row)), _DIVIDER)
     row += 16 + 12
     canvas.text((left, row), item["source"], 20, _TEXT_3, anchor="lm")
+    canvas.text((right - item["metrics_inset"], row), item["metrics"], 19, _TEXT_2, anchor="rm")
     if item["images"]:
         canvas.text((right, row), item["images"], 20, _TEXT_3, anchor="rm")
         canvas.picture(right - canvas.length(item["images"], 20) - 20, row, _TEXT_3)
@@ -492,7 +527,8 @@ def _header(canvas, digest, hours):
     band.paste(Image.new("RGB", (width, height), "#FFFFFF"), mask=glow)
     canvas.image.paste(band)
     canvas.text((56, 52), f"CAMPUS DIGEST·每 {hours} 小时", 19, "#C9D8FF", bold=True)
-    canvas.text((54, 92), "校园墙新帖速览", 52, "#FFFFFF", bold=True)
+    heading = "校园墙高赞精选" if digest.get("ranking") == "likes" else "校园墙新帖速览"
+    canvas.text((54, 92), heading, 52, "#FFFFFF", bold=True)
     community = canvas.wrap(canvas.fonts.clean(digest["community"], 256).replace("\n", " "), 24, 960, 1)[0]
     canvas.text((57, 168), community, 24, "#DCE6FF")
 
@@ -508,7 +544,8 @@ def _overview(canvas, digest, start, end, shown, intro, y):
     columns = (x0 + 40, 480, 760)
     for column in columns[1:]:
         canvas.line(((column - 32, y + 36), (column - 32, y + 140)), _DIVIDER, 2)
-    labels = ("统计时段（北京时间）", "已收集新帖", "本期展示")
+    ranked = digest.get("ranking") == "likes"
+    labels = ("统计时段（北京时间）", "已收集新帖", "本期精选" if ranked else "本期展示")
     for column, label in zip(columns, labels):
         canvas.text((column, y + 34), label, 19, _TEXT_3)
     canvas.text((columns[0], y + 66), f"{start:%H:%M} – {end:%H:%M}", 38, _TEXT, bold=True)
@@ -517,7 +554,10 @@ def _overview(canvas, digest, start, end, shown, intro, y):
     for column, value in ((columns[1], total), (columns[2], str(shown))):
         canvas.text((column, y + 66), value, 38, _TEXT, bold=True)
         canvas.text((column + canvas.length(value, 38, True) + 6, y + 100), "条", 20, _TEXT_2, anchor="ls")
-    canvas.text((columns[1], y + 120), "按发布时间去重", 19, _TEXT_3)
+    order = "按发布时间去重"
+    if ranked:
+        order = "按已收集帖点赞优先" if digest["scan_limited"] else "按点赞优先"
+    canvas.text((columns[1], y + 120), order, 19, _TEXT_3)
     if digest["mode"] == "ai":
         mode, colors = "AI 整理", _TAGS["blue"]
     else:
@@ -575,7 +615,7 @@ def _page(digest, start, end, items, fonts, page_index, pages, shown, thumbnails
             background, border, ink = _TAGS["gold"]
             canvas.box((40, y, 1040, y + 52), 10, background, border)
             canvas.badge(68, y + 26, "!", "#FAAD14")
-            canvas.text((92, y + 26), "扫描未完成：仅展示已收集内容，数量可能不完整", 20, _TEXT, anchor="lm")
+            canvas.text((92, y + 26), "仅展示已收集的新帖，可能还有遗漏", 20, _TEXT, anchor="lm")
             y += alert
         canvas.box((40, y, 1040, y + note), 10, "#E9EBEE")
         canvas.badge(68, y + 18 + 15, "i", _TEXT_3)
@@ -611,6 +651,13 @@ def render_digest(digest: dict, output_dir, font_path="") -> list[str]:
     is shown; ``image_count`` remains the total number of original attachments.
     Missing, unreadable or corrupt images use the unchanged full-width text
     layout. This renderer never downloads, changes or deletes the cached image.
+
+    Optional ``like_count``/``trace_count``/``comment_count`` are non-negative
+    integers or None (unknown). Likes and follows always show; comments appear
+    only if they fit without crowding the source or image counter. Unknown likes
+    and follows use —, zero stays 0, large counts use 万/亿 (capped at 999亿+).
+    ``ranking='likes'`` selects ranked labels; item selection/order is the caller's
+    responsibility. Legacy digests can still supply eight items over two pages.
     """
     created = []
     pending = None

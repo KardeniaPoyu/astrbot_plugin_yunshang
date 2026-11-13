@@ -1,3 +1,5 @@
+import copy
+import json
 import unittest
 from presentation import format_overview, is_campus_request, public_query_result
 
@@ -47,5 +49,48 @@ class PresentationTests(unittest.TestCase):
         self.assertNotIn('image_urls',clean['posts'][0])
         self.assertNotIn('thumbnail_urls',clean['posts'][0])
         self.assertIn('image_urls',result['posts'][0])
+
+    def test_overview_shows_compact_known_counts_and_keeps_unknowns_unknown(self):
+        result = self.result()
+        result['posts'] = [
+            {**result['posts'][0], 'text': '已知互动', 'like_count': 12, 'trace_count': 0},
+            {**result['posts'][1], 'text': '部分已知', 'like_count': None, 'trace_count': 3},
+            {**result['posts'][2], 'text': '完全未知', 'like_count': None, 'trace_count': None},
+        ]
+        before = copy.deepcopy(result)
+        output = format_overview(result)
+        blocks = output.split('\n\n')
+        self.assertIn('赞12 · 蹲蹲0', blocks[1])
+        self.assertIn('蹲蹲3', blocks[2])
+        self.assertNotIn('赞', blocks[2])
+        self.assertNotIn('赞', blocks[3])
+        self.assertNotIn('蹲蹲', blocks[3])
+        self.assertNotIn('None', output)
+        self.assertEqual(result, before)
+
+    def test_engagement_labels_preserve_overview_paragraph_and_length_bounds(self):
+        result = self.result()
+        for post in result['posts']:
+            post.update(like_count=150, trace_count=20, comment_count=10)
+        output = format_overview(result)
+        self.assertLess(len(output), 450)
+        self.assertEqual(len(output.split('\n\n')), 5)  # Header, three posts, command.
+        self.assertEqual(output.count('赞150 · 蹲蹲20'), 3)
+        self.assertEqual(output.count('（节选）'), 3)
+        for post in result['posts']:
+            self.assertEqual(output.count(f"#{post['id']} ·"), 1)
+
+    def test_public_tool_retains_metrics_and_source_snapshot_without_image_links(self):
+        result = self.result()
+        result['posts'][0].update(like_count=0, trace_count=None, comment_count=7,
+                                  image_urls=['https://ysxy.img.qimiaoyuanfen.com/private.jpg'],
+                                  thumbnail_urls=['private-thumbnail'], image_path='private-path')
+        before = copy.deepcopy(result)
+        public = public_query_result(result)
+        post = public['posts'][0]
+        self.assertEqual((post['like_count'], post['trace_count'], post['comment_count']), (0, None, 7))
+        self.assertNotIn('private', json.dumps(public))
+        post['like_count'] = 99
+        self.assertEqual(result, before)
 
 if __name__=='__main__':unittest.main()

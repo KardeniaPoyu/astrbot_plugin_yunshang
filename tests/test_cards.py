@@ -37,7 +37,7 @@ class CardsTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.fonts = self.cards._Fonts("")
 
-    def render_with_text(self, digest):
+    def render_with_text(self, digest, positions=None):
         """Observe the real Pillow draw calls while still drawing every glyph."""
         drawn = []
         original = ImageDraw.ImageDraw.text
@@ -50,6 +50,8 @@ class CardsTests(unittest.TestCase):
             self.assertLessEqual(box[2], draw.im.size[0])
             self.assertLessEqual(box[3], draw.im.size[1])
             drawn.append(text)
+            if positions is not None:
+                positions.append((text, box))
             return original(draw, xy, text, *args, **kwargs)
 
         with patch.object(ImageDraw.ImageDraw, "text", capture):
@@ -72,12 +74,111 @@ class CardsTests(unittest.TestCase):
                 self.assertGreater(im.height, 1000)
             self.assertLess(Path(path).stat().st_size, 2_000_000)
         for expected in ("本期展示", "12:00", "16:00", "北京时间", "AI",
-                         "12", "8", "扫描未完成", "配图2张", "1 / 2", "2 / 2"):
+                         "12", "8", "可能还有遗漏", "配图2张", "1 / 2", "2 / 2"):
             self.assertIn(expected, text)
         for i in range(1, 9):
             self.assertEqual(text.count(f"DEMO-{i:03}"), 1)
         self.assertEqual(text.count("寻找周末一起读书的同学"), 8)
         self.assertNotIn("非官方", text)
+
+    def test_ranked_digest_labels_four_selected_posts_and_keeps_supplied_order(self):
+        digest = fixture(4, ranking="likes")
+        for item, likes in zip(digest["items"], (128, 96, 74, 52)):
+            item.update(like_count=likes, trace_count=12, comment_count=7)
+        before = copy.deepcopy(digest)
+        paths, text = self.render_with_text(digest)
+        self.assertEqual(len(paths), 1)
+        self.assertEqual(digest, before)
+        for expected in ("校园墙高赞精选", "本期精选", "按点赞优先", "每 4 小时",
+                         "点赞 128 · 蹲蹲 12 · 评论 7", "1 / 1"):
+            self.assertIn(expected, text)
+        self.assertNotIn("校园墙新帖速览", text)
+        self.assertNotIn("可能还有遗漏", text)
+        self.assertLess(text.index("DEMO-001"), text.index("DEMO-004"))
+        _, legacy = self.render_with_text(fixture(1))
+        self.assertIn("校园墙新帖速览", legacy)
+        self.assertIn("本期展示", legacy)
+
+    def test_partial_ranked_digest_describes_incomplete_collection_without_disclaimers(self):
+        _, text = self.render_with_text(fixture(4, ranking="likes", scan_limited=True))
+        self.assertIn("按已收集帖点赞优先", text)
+        self.assertIn("仅展示已收集的新帖，可能还有遗漏", text)
+        for banned in ("扫描未完成", "未经核实", "图片未识别", "附图未识别"):
+            self.assertNotIn(banned, text)
+
+    def test_metrics_distinguish_unknown_zero_and_large_counts(self):
+        digest = fixture(4, ranking="likes")
+        digest["items"][0].update(like_count=None, trace_count=0, comment_count=None)
+        digest["items"][1].update(like_count=0, trace_count=None, comment_count=0)
+        digest["items"][2].update(like_count=12_345, trace_count=100_000_000,
+                                  comment_count=99_999)
+        # Missing metrics stay unknown, rather than being reported as zero.
+        _, text = self.render_with_text(digest)
+        for expected in ("点赞 — · 蹲蹲 0", "点赞 0 · 蹲蹲 — · 评论 0",
+                         "点赞 1.2万 · 蹲蹲 1亿 · 评论 9.9万", "点赞 — · 蹲蹲 —"):
+            self.assertIn(expected, text)
+        self.assertNotIn("评论 —", text)
+        self.assertNotIn("None", text)
+
+    def test_footer_metrics_do_not_overlap_source_or_image_count(self):
+        digest = fixture(4, ranking="likes")
+        for i, item in enumerate(digest["items"]):
+            item.update(id=(f"DEMO-{i:03}-" + "长来源编号" * 30) if i < 3 else "DEMO-SHORT",
+                        image_count=9999, like_count=99_999_999,
+                        trace_count=10 ** 100, comment_count=10 ** 100)
+        positions = []
+        paths, text = self.render_with_text(digest, positions)
+        self.assertEqual(text.count("点赞 9999.9万 · 蹲蹲 999亿+"), 4)
+        self.assertEqual(text.count("评论 999亿+"), 1, "Omit comments when the source needs the space")
+        self.assertEqual(text.count("配图999+张"), 4)
+        footers = [(label, box) for label, box in positions
+                   if label.startswith(("原帖 #", "点赞 ", "配图"))]
+        self.assertEqual(len(footers), 12)
+        for offset in range(0, len(footers), 3):
+            row = sorted(footers[offset:offset + 3], key=lambda entry: entry[1][0])
+            for (_, left), (right_label, right) in zip(row, row[1:]):
+                # Pixel assertions use real Pillow glyph bounds at render scale.
+                # The image counter also needs room for its 20px icon.
+                gap = 30 if right_label.startswith("配图") else 16
+                self.assertLessEqual(left[2] + gap * 2, right[0])
+        with Image.open(paths[0]) as rendered:
+            self.assertEqual(rendered.width, 1080)
+            self.assertLessEqual(rendered.height, 2400)
+
+    def test_invalid_optional_counts_raise_before_writing(self):
+        for key in ("like_count", "trace_count", "comment_count"):
+            for value in (-1, True, "12", 1.5):
+                digest = fixture(1)
+                digest["items"][0][key] = value
+                with self.subTest(key=key, value=value), self.assertRaises(self.cards.RenderError):
+                    self.cards.render_digest(digest, self.temp.name)
+        self.assertFalse(list(Path(self.temp.name).iterdir()))
+
+    def test_duplicate_excerpt_summary_is_drawn_once_without_placeholder(self):
+        sentence = "合成示例里的小动物真可爱"
+        digest = fixture(1, mode="excerpt")
+        digest["items"][0]["title"] = sentence
+        for summary in (sentence, f" \t{sentence[:4]}　{sentence[4:]} 。！？ ", sentence + "..."):
+            with self.subTest(summary=summary):
+                digest["items"][0]["summary"] = summary
+                positions = []
+                paths, text = self.render_with_text(digest, positions)
+                with Image.open(paths[0]) as rendered:
+                    compact_height = rendered.height
+                matching_draws = [label for label, _ in positions
+                                  if "".join(label.split()).rstrip("。！？.!?") == sentence]
+                self.assertEqual(len(matching_draws), 1)
+                self.assertNotIn("请查看原帖了解详情", text)
+        digest["items"][0]["summary"] = "另一句合成说明"
+        paths, text = self.render_with_text(digest)
+        self.assertIn("另一句合成说明", text)
+        with Image.open(paths[0]) as rendered:
+            self.assertGreater(rendered.height, compact_height)
+        # A title clamped to two lines must not hide the longer summary's detail.
+        long_text = "合成测试。" * 14 + "摘要里保留的细节"
+        digest["items"][0].update(title=long_text, summary=long_text)
+        _, text = self.render_with_text(digest)
+        self.assertIn("摘要里保留的细节", text)
 
     def color_region(self, image, color):
         """Locate source-image pixels with tolerance for JPEG/resampling noise."""
@@ -206,6 +307,7 @@ class CardsTests(unittest.TestCase):
             item.update(title="长标题（中英文 Mixed）：" * 3000,
                         summary=("超长段落👩‍🎓😀\n\n" + "Token" * 400) * 20,
                         category="很长的分类名称" * 200, image_count=99,
+                        like_count=99_999_999, trace_count=10 ** 100, comment_count=999,
                         image_path=photo)
         paths, text = self.render_with_text(digest)
         self.assertEqual(len(paths), 2)

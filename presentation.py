@@ -17,6 +17,13 @@ def is_campus_request(text):
     return bool(re.search(r'校园墙|校园圈|校友圈|民大表白墙', str(text or '')))
 
 
+def format_counts(post):
+    """Compact engagement labels; unknown is distinct from a known zero."""
+    return ' · '.join(f'{label}{post[key]}'
+                      for key, label in (('like_count', '赞'), ('trace_count', '蹲蹲'))
+                      if type(post.get(key)) is int and post[key] >= 0)
+
+
 def format_overview(result):
     posts = result['posts']
     lines = [f"{result['community']} · {len(posts)}条动态"]
@@ -30,6 +37,9 @@ def format_overview(result):
             body += '（节选）'
         date = str(post.get('published_at') or '')[:16].replace('T', ' ')
         note = f" · 配图{post['image_count']}张" if post.get('image_count') else ''
+        counts = format_counts(post)
+        if counts:
+            note = f' · {counts}' + note
         lines.append(f"{index}. {body}\n#{post['id']} · {date}{note}")
     lines.append('看原文：/校园圈 详情 帖子ID')
     return '\n\n'.join(lines)
