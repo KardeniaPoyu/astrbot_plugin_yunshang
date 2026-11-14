@@ -14,7 +14,7 @@ import unittest
 import uuid
 
 from client import CampusError
-from digest import build_digest, build_prompt, digest_as_text, SYSTEM_PROMPT
+from digest import build_digest, build_prompt, candidates, digest_as_text, SYSTEM_PROMPT
 
 
 def plugin_class(overrides):
@@ -27,7 +27,7 @@ def plugin_class(overrides):
     tree = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
     scope = dict(asyncio=asyncio, time=time, uuid=uuid, CampusError=CampusError,
                  logger=logging.getLogger('test.campus.flow'), SYSTEM_PROMPT=SYSTEM_PROMPT,
-                 build_digest=build_digest, build_prompt=build_prompt,
+                 build_digest=build_digest, build_prompt=build_prompt, candidates=candidates,
                  digest_as_text=digest_as_text, **overrides)
     exec(compile(tree, str(path), 'exec'), scope)
     return scope['Plugin']
@@ -49,13 +49,36 @@ class MainFlowTests(unittest.IsolatedAsyncioTestCase):
             async def fetch_window(self, *args):
                 return dict(posts=copy.deepcopy(outer.posts), total=len(outer.posts), scanned=len(outer.posts),
                             scan_limited=False, invalid_dates=0)
+            async def hot_comments(self, post_ids):
+                outer.comment_requests.append(list(post_ids))
+                return copy.deepcopy(outer.comments)
             async def close(self):pass
+        self.comments, self.comment_requests = {}, []
         def renderer(digest, *args):
             outer.rendered.append(copy.deepcopy(digest))
             return [f'{outer.tmp.name}/long-image.png']
         self.overrides = dict(CampusClient=Collector, render_digest=renderer)
         self.plugin = self.make_plugin()
         self.end = datetime(2026,11,13,16,tzinfo=timezone(timedelta(hours=8)))
+
+    async def test_top10_comments_are_requested_for_selected_posts_and_attached(self):
+        self.comments = {'1000': [dict(name='热心同学', text='热评', like_count=5, is_author=False, replies=[])],
+                         '9999': [dict(name='无关', text='不应出现', like_count=1, is_author=False, replies=[])]}
+        digest, pages = await self.plugin._prepare_digest(self.end - timedelta(hours=4), self.end)
+        self.assertEqual(self.comment_requests, [[p['id'] for p in self.posts[:10]]])
+        self.assertEqual(self.rendered[0]['items'][0]['comments'][0]['name'], '热心同学')
+        self.assertEqual(sum('comments' in item for item in self.rendered[0]['items']), 1)
+
+    async def test_comment_failure_still_sends_the_card(self):
+        async def broken(*args):
+            raise RuntimeError('synthetic comment failure')
+        original = self.overrides['CampusClient']
+        class Failing(original):
+            hot_comments = broken
+        self.plugin = self.make_plugin(CampusClient=Failing)
+        digest, pages = await self.plugin._prepare_digest(self.end - timedelta(hours=4), self.end)
+        self.assertEqual(len(pages), 1)
+        self.assertFalse(any('comments' in item for item in self.rendered[0]['items']))
 
     def make_plugin(self, **updates):
         plugin = plugin_class({**self.overrides, **updates})()

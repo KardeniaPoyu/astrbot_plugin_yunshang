@@ -82,6 +82,7 @@ _TAG_KEYWORDS = (
     (("兼职", "实习", "招聘"), "cyan"),
 )
 _TAG_FALLBACK = ("geekblue", "cyan", "purple", "green", "blue")
+_AVATAR_COLORS = ("blue", "cyan", "green", "purple", "magenta", "orange", "geekblue", "volcano")
 _OPENING = frozenset("（【《〈「『〔［｛“‘([{«")
 _CLOSING = frozenset("，。！？；：、）】》〉」』〕］｝”’…,.!?;:)]}»")
 _EMOJI = re.compile(
@@ -408,17 +409,11 @@ def _metric_count(count):
     return f"{whole}.{tenth}{suffix}" if tenth else f"{whole}{suffix}"
 
 
-class _Canvas:
-    """Native-resolution long canvas with anti-aliased text and local shadows."""
+class _Metrics:
+    """Text measurement with the exact canvas fonts, without allocating an image."""
 
-    def __init__(self, fonts, height):
+    def __init__(self, fonts):
         self.fonts = fonts
-        self.image = Image.new("RGB", (WIDTH * _SCALE, height * _SCALE), _BG)
-        self.draw = ImageDraw.Draw(self.image)
-
-    @staticmethod
-    def _s(values):
-        return tuple(round(v * _SCALE) for v in values)
 
     def font(self, size, bold=False):
         return self.fonts.get(size * _SCALE, bold)
@@ -428,6 +423,19 @@ class _Canvas:
 
     def length(self, text, size, bold=False):
         return self.font(size, bold).getlength(text) / _SCALE
+
+
+class _Canvas(_Metrics):
+    """Native-resolution long canvas with anti-aliased text and local shadows."""
+
+    def __init__(self, fonts, height):
+        super().__init__(fonts)
+        self.image = Image.new("RGB", (WIDTH * _SCALE, height * _SCALE), _BG)
+        self.draw = ImageDraw.Draw(self.image)
+
+    @staticmethod
+    def _s(values):
+        return tuple(round(v * _SCALE) for v in values)
 
     def text(self, xy, text, size, fill=_TEXT, bold=False, anchor="lt"):
         self.draw.text(self._s(xy), text, font=self.font(size, bold), fill=fill, anchor=anchor)
@@ -489,12 +497,100 @@ class _Canvas:
         self.ellipse((cx - 11, cy - 11, cx + 11, cy + 11), fill=fill)
         self.text((cx, cy + 1), glyph, 16, ink, bold=True, anchor="mm")
 
+    def avatar(self, cx, cy, radius, name):
+        """Initial-letter avatar; a 4x mask keeps the circle edge smooth at 1x."""
+        initial = name[:1] or "同"
+        _, _, color = _TAGS[_AVATAR_COLORS[sum(map(ord, name)) % len(_AVATAR_COLORS)]]
+        size = 2 * radius
+        with Image.new("L", (size * 4, size * 4), 0) as big:
+            ImageDraw.Draw(big).ellipse((0, 0, size * 4 - 1, size * 4 - 1), fill=255)
+            with big.resize((size, size), Image.LANCZOS) as mask:
+                self.image.paste(color, (cx - radius, cy - radius, cx + radius, cy + radius), mask)
+        self.text((cx, cy), initial, round(radius * 0.95), "#FFFFFF", bold=True, anchor="mm")
+
+    def chip(self, x, cy, label, background=_BRAND_SOFT, ink=_BRAND, size=16):
+        width = self.length(label, size, True) + 14
+        self.box((x, cy - 12, x + width, cy + 12), 6, background)
+        self.text((x + width / 2, cy), label, size, ink, bold=True, anchor="mm")
+        return width
+
     def finish(self, height):
         if height == self.image.height:
             return self.image
         result = self.image.crop((0, 0, WIDTH, height))
         self.image.close()
         return result
+
+
+def _comment_layout(canvas, comments, width, text_lines, reply_lines):
+    """Measured comment threads: avatar, name, likes, text, indented replies.
+
+    Sizes avoid 26px, which identifies original post body lines.
+    """
+    clean = canvas.fonts.clean
+    blocks = []
+    for comment in comments if isinstance(comments, list) else []:
+        if not isinstance(comment, dict):
+            continue
+        likes = comment.get("like_count")
+        likes = f"赞 {_metric_count(likes)}" if type(likes) is int and likes > 0 else ""
+        name_width = width - 48 - 64 - (canvas.length(likes, 19) + 16 if likes else 0)
+        name = canvas.wrap(clean(comment.get("name"), 64).replace("\n", " ") or "匿名同学",
+                           20, max(120, name_width), 1, bold=True)[0]
+        text = canvas.wrap(clean(comment.get("text"), 600) or "（无文字）", 22, width - 48, text_lines)
+        replies = []
+        for reply in (comment.get("replies") or [])[:3]:
+            if not isinstance(reply, dict):
+                continue
+            who = canvas.wrap(clean(reply.get("name"), 64).replace("\n", " ") or "匿名同学",
+                              19, 300, 1, bold=True)[0]
+            target = clean(reply.get("reply_to"), 64).replace("\n", " ")
+            target = canvas.wrap("回复 " + target, 19, 300, 1)[0] if target else ""
+            lines = canvas.wrap(clean(reply.get("text"), 600) or "（无文字）", 21, width - 68, reply_lines)
+            replies.append(dict(name=who, author=bool(reply.get("is_author")), target=target,
+                                lines=lines, height=28 + 32 * len(lines)))
+        height = 36 + 34 * len(text)
+        if replies:
+            height += 12 + sum(r["height"] for r in replies) + 10 * (len(replies) - 1) + 4
+        blocks.append(dict(name=name, author=bool(comment.get("is_author")), likes=likes,
+                           text=text, replies=replies, height=height))
+    return blocks
+
+
+def _draw_comment(canvas, block, x, y, width):
+    canvas.avatar(x + 18, y + 18, 18, block["name"])
+    canvas.text((x + 48, y + 14), block["name"], 20, _TEXT, bold=True, anchor="lm")
+    if block["author"]:
+        canvas.chip(x + 56 + canvas.length(block["name"], 20, True), y + 14, "楼主")
+    if block["likes"]:
+        canvas.text((x + width, y + 14), block["likes"], 19, _TEXT_3, anchor="rm")
+    row = y + 36
+    for line in block["text"]:
+        canvas.text((x + 48, row), line, 22, _TEXT_2)
+        row += 34
+    if block["replies"]:
+        row += 12
+        top = row
+        for reply in block["replies"]:
+            cursor = x + 68
+            canvas.text((cursor, row + 12), reply["name"], 19, _TEXT, bold=True, anchor="lm")
+            cursor += canvas.length(reply["name"], 19, True) + 8
+            if reply["author"]:
+                cursor += canvas.chip(cursor, row + 12, "楼主") + 8
+            if reply["target"]:
+                canvas.text((cursor, row + 12), reply["target"], 19, _TEXT_3, anchor="lm")
+            line_y = row + 28
+            for line in reply["lines"]:
+                canvas.text((x + 68, line_y), line, 21, _TEXT_2)
+                line_y += 32
+            row += reply["height"] + 10
+        canvas.box((x + 48, top, x + 51, row - 10), 1, _BORDER)
+
+
+def _comments_title(comments):
+    liked = any(type(c.get("like_count")) is int and c["like_count"] > 0
+                for c in comments if isinstance(c, dict))
+    return "高赞热评" if liked else "评论精选"
 
 
 def _item_layout(item, canvas, start, number, gallery_count):
@@ -535,11 +631,18 @@ def _item_layout(item, canvas, start, number, gallery_count):
     body_height = title_height + 39 * len(body) + (32 if excerpt else 0)
     if gallery_count:
         body_height += 22 + _GALLERY_HEIGHT
+    comments = _comment_layout(canvas, item.get("comments"), 880, 2, 1)
+    comments_top = body_height
+    if comments:
+        # Panel: 18 padding + 24 label + 14, threads 18 apart, 18 padding.
+        body_height += 22 + 18 + 24 + 14 + sum(c["height"] for c in comments) + 18 * (len(comments) - 1) + 18
     height = 28 + 32 + 18 + body_height + 18 + 16 + 24 + 24
     return dict(title=title, body=body, excerpt=excerpt, category=category, source=source,
                 images=images, when=when, height=height, number=number,
                 metrics=metrics, metrics_inset=metrics_inset,
-                colors=_tag_color(category), gallery_count=gallery_count, body_height=body_height)
+                colors=_tag_color(category), gallery_count=gallery_count, body_height=body_height,
+                comments=comments, comments_top=comments_top,
+                comments_title=_comments_title(item.get("comments") or []))
 
 
 def _draw_item(canvas, item, y, gallery):
@@ -571,6 +674,14 @@ def _draw_item(canvas, item, y, gallery):
         size = _gallery_size(len(gallery))
         for index, image in enumerate(gallery):
             canvas.thumbnail(left + index * (size[0] + _GALLERY_GAP), row, image, size)
+    if item["comments"]:
+        top = body_top + item["comments_top"] + 22
+        canvas.box((left, top, right, body_top + item["body_height"]), 12, "#F7F8FA")
+        canvas.text((left + 20, top + 18 + 12), item["comments_title"], 18, _TEXT_3, bold=True, anchor="lm")
+        row = top + 18 + 24 + 14
+        for block in item["comments"]:
+            _draw_comment(canvas, block, left + 20, row, 880)
+            row += block["height"] + 18
     row = body_top + item["body_height"] + 18
     canvas.line(((left, row), (right, row)), _DIVIDER)
     row += 16 + 12
@@ -867,9 +978,17 @@ def _load_detail_qr(value):
         return None
 
 
-def _detail_chrome(metadata, gallery, qr):
+def _detail_comments_height(blocks):
+    if not blocks:
+        return 0
+    return 14 + 28 + 30 + 22 + sum(b["height"] for b in blocks) + 41 * (len(blocks) - 1)
+
+
+def _detail_chrome(metadata, gallery, qr, comments=False):
     """Heights around the body: (card bottom offset after body, page tail)."""
     after_body = (28 + _GALLERY_HEIGHT if gallery else 0) + 28 + 1 + 20 + 28 + 32
+    if comments:
+        after_body += _detail_comments_height(metadata["comments"])
     if qr:
         after_body += _DETAIL_QR_PANEL + 40
         tail = 0
@@ -880,7 +999,8 @@ def _detail_chrome(metadata, gallery, qr):
 
 def _detail_page(metadata, lines, fonts, page_index, pages, gallery, qr=None):
     """Render one bounded native page; no canvas survives its save/close cycle."""
-    after_body, tail = _detail_chrome(metadata, gallery, qr is not None)
+    last = page_index == pages - 1
+    after_body, tail = _detail_chrome(metadata, gallery, qr is not None, last)
     bottom = _DETAIL_BODY_TOP + _DETAIL_LINE * len(lines) + after_body
     height = bottom + tail
     if height > MAX_HEIGHT:
@@ -920,6 +1040,18 @@ def _detail_page(metadata, lines, fonts, page_index, pages, gallery, qr=None):
             canvas.text((right, row), metadata["images"], 20, _TEXT_3, anchor="rm")
             canvas.picture(right - canvas.length(metadata["images"], 20) - 20, row, _TEXT_3)
 
+        if last and metadata["comments"]:
+            row += 14 + 28
+            canvas.text((left, row), metadata["comments_heading"], 22, _TEXT, bold=True)
+            if metadata["comments_note"]:
+                canvas.text((right, row + 15), metadata["comments_note"], 18, _TEXT_3, anchor="rm")
+            row += 30 + 22
+            for index, block in enumerate(metadata["comments"]):
+                if index:
+                    canvas.line(((left + 48, row - 21), (right, row - 21)), _DIVIDER)
+                _draw_comment(canvas, block, left, row, 920)
+                row += block["height"] + 41
+            row -= 41
         if qr is not None:
             top = row + 14 + 32
             canvas.box((left, top, right, top + _DETAIL_QR_PANEL), 14, "#F5F7FA")
@@ -999,9 +1131,17 @@ def render_post_detail(post: dict, community, output_dir, font_path="") -> list[
             notice=wrap(f"查看原帖：/校园墙 详情 {source_id}　查看配图：/校园墙 图片 {source_id}", 19, 900, 2),
             commands=[wrap(f"全文  /校园墙 详情 {source_id}", 19, 560, 1)[0],
                       wrap(f"配图  /校园墙 图片 {source_id}", 19, 560, 1)[0]])
+        probe = _Metrics(fonts)
+        comments = record.get("comments") if isinstance(record.get("comments"), list) else []
+        metadata["comments"] = _comment_layout(probe, comments, 920, 6, 3)
+        total = record.get("comment_count")
+        shown = len(metadata["comments"])
+        metadata["comments_heading"] = _comments_title(comments)
+        metadata["comments_note"] = (f"共 {_metric_count(total)} 条评论，展示 {shown} 条"
+                                     if type(total) is int and total > shown else "")
         qr = _load_detail_qr(record.get("mini_app_qr_data_url"))
         # Reserve the final page's photos and code on every page: simple and bounded.
-        after_body, tail = _detail_chrome(metadata, _gallery_count(record), qr is not None)
+        after_body, tail = _detail_chrome(metadata, _gallery_count(record), qr is not None, True)
         per_page = (MAX_HEIGHT - _DETAIL_BODY_TOP - after_body - tail) // _DETAIL_LINE
         if per_page < 1:
             raise RenderError("Post detail body region is too small")

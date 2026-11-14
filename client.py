@@ -109,6 +109,81 @@ def _engagement_count(value):
     return value if type(value) is int and 0 <= value <= 1_000_000_000 else None
 
 
+# /article/article/info embeds comments. Public clients of the same endpoint read
+# comment_list[].detail/show_user_name/create_time and reply_comment_list[] with
+# reply_show_user_name. Like and author fields are undocumented: only these exact
+# names are accepted; when absent, cards say 评论 (not 高赞) and omit 楼主.
+_COMMENT_LIKE_FIELDS = ('count_star', 'star_count', 'like_count', 'count_like', 'zan_count')
+_COMMENT_OWNER_FLAGS = ('is_author', 'is_owner', 'is_louzhu', 'is_landlord')
+_COMMENT_USER_FIELDS = ('user_id', 'uid')
+_COMMENT_SCAN = 50
+_REPLY_SCAN = 20
+
+
+def _flag(value):
+    if value in (True, 1, '1', 'true'):
+        return True
+    if value in (False, 0, '0', 'false'):
+        return False
+    return None
+
+
+def _comment(row, owner, *, reply=False):
+    if not isinstance(row, dict):
+        return None
+    text = clean_text(row.get('detail', ''))
+    if not text:
+        return None
+    flags = [_flag(row[key]) for key in _COMMENT_OWNER_FLAGS if key in row]
+    if any(flag is not None for flag in flags):
+        is_author = any(flags)
+    else:
+        user = next((str(row[key]) for key in _COMMENT_USER_FIELDS if row.get(key) not in (None, '', 0, '0')), '')
+        is_author = bool(owner and user == owner)
+    like = next((_engagement_count(row[key]) for key in _COMMENT_LIKE_FIELDS if key in row), None)
+    view = {'name': clean_text(row.get('show_user_name') or '')[:24] or '匿名同学',
+            'text': text[:300] + ('…' if len(text) > 300 else ''),
+            'published_at': clean_text(row.get('create_time', ''))[:40],
+            'like_count': like, 'is_author': is_author}
+    if reply:
+        view['reply_to'] = clean_text(row.get('reply_show_user_name') or '')[:24]
+    else:
+        replies = row.get('reply_comment_list')
+        replies = replies[:_REPLY_SCAN] if isinstance(replies, list) else []
+        view['replies'] = [r for r in (_comment(x, owner, reply=True) for x in replies) if r]
+    return view
+
+
+def comments_view(raw):
+    """Sanitized comments embedded in a detail payload; None if not provided."""
+    rows = raw.get('comment_list') if isinstance(raw, dict) else None
+    if not isinstance(rows, list):
+        return None
+    owner = next((str(raw[key]) for key in _COMMENT_USER_FIELDS if raw.get(key) not in (None, '', 0, '0')), '')
+    return [c for c in (_comment(row, owner) for row in rows[:_COMMENT_SCAN]) if c]
+
+
+def select_comments(comments, *, limit, replies, author_threads=0):
+    """Most-liked comments first (stable on ties), each with its best replies.
+
+    Replies by the original poster come first. ``author_threads`` adds up to that
+    many further threads where the poster replied, so 楼主回复 are not dropped
+    just because the thread itself has few likes.
+    """
+    def likes(comment):
+        return comment['like_count'] if comment['like_count'] is not None else -1
+
+    def trimmed(comment):
+        chosen = sorted(comment['replies'], key=lambda r: (not r['is_author'], -likes(r)))[:replies]
+        return {**comment, 'replies': [r for r in comment['replies'] if r in chosen]}
+
+    ranked = sorted(comments or [], key=likes, reverse=True)
+    picked = ranked[:limit]
+    extra = [c for c in ranked[limit:] if c['is_author'] or any(r['is_author'] for r in c['replies'])]
+    picked += extra[:author_threads]
+    return [trimmed(c) for c in sorted(picked, key=ranked.index)]
+
+
 def _published_time(value):
     # The feed's plain timestamps are Beijing wall time. Require a full time;
     # date-only/relative labels cannot safely be assigned to a four-hour window.
@@ -311,6 +386,9 @@ class CampusClient:
         if detail:
             view.update(mini_app_path=f'{MINI_APP_DETAIL_PATH}?id={view["id"]}',
                         mini_app_id=MINI_APP_ID)
+            comments = comments_view(raw)
+            if comments is not None:
+                view['comments'] = select_comments(comments, limit=5, replies=3, author_threads=2)
         return view
 
     async def fetch_window(self, start: datetime, end: datetime, *, max_pages=100, page_size=20) -> dict:
@@ -400,6 +478,34 @@ class CampusClient:
             posts = [view for _, view in collected]
             return {'posts': posts, 'total': len(posts), 'scanned': scanned,
                     'scan_limited': uncertain or not complete, 'invalid_dates': invalid_dates}
+
+    async def hot_comments(self, post_ids, *, limit=2, replies=1, concurrency=3):
+        """Selected comments per post ID from read-only detail calls.
+
+        Best effort for the Top10 image: a failed, mismatched or comment-less
+        post is simply absent from the result. The community is checked before
+        and after, so a raced campus switch returns nothing.
+        """
+        cid = await self._scope()
+        gate = asyncio.Semaphore(concurrency)
+
+        async def one(post_id):
+            async with gate:
+                try:
+                    raw = await self._post('/article/article/info', {'from_type': 1, 'id': post_id},
+                                           invalidate_login=False)
+                except CampusError:
+                    return post_id, None
+            if (not isinstance(raw, dict) or str(raw.get('id', '')) != str(post_id)
+                    or str(raw.get('community_id') or '') != cid):
+                return post_id, None
+            comments = comments_view(raw)
+            return post_id, comments and select_comments(comments, limit=limit, replies=replies)
+
+        results = await asyncio.gather(*(one(str(pid)) for pid in post_ids))
+        if await self._scope() != cid:
+            return {}
+        return {pid: comments for pid, comments in results if comments}
 
     async def query(self, action='latest', *, keyword='', post_id='', limit=5):
         action = str(action).lower().strip()

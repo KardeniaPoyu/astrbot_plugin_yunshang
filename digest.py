@@ -157,7 +157,7 @@ def build_prompt(posts):
     return json.dumps({'posts': _model_sources(candidates(posts))}, ensure_ascii=False)
 
 
-def build_digest(collection, start, end, *, community='民大校园墙', ai_reply=None, max_items=10):
+def build_digest(collection, start, end, *, community='民大校园墙', ai_reply=None, max_items=10, comments=None):
     selected = candidates(collection.get('posts', []), limit=max_items)
     visible = {post['id']: post['text'] for post in _model_sources(selected)}
     summaries = {}
@@ -186,6 +186,8 @@ def build_digest(collection, start, end, *, community='民大校园墙', ai_repl
             item.update(title=_short(row['title'], 32), summary=_short(row['summary'], 180))
             mode = 'ai'
         item['body'] = item.pop('text')
+        if comments and comments.get(post['id']):
+            item['comments'] = copy.deepcopy(comments[post['id']])
         chosen.append(item)
     return {
         'community': community, 'window_start': start.isoformat(), 'window_end': end.isoformat(),

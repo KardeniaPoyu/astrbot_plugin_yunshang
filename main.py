@@ -16,7 +16,7 @@ from astrbot.api.star import Context, Star, StarTools, register
 from .client import CampusClient, CampusError
 from .cards import render_digest, render_post_detail
 from .delivery import DeliveryStore
-from .digest import SYSTEM_PROMPT, build_prompt, build_digest, digest_as_text
+from .digest import SYSTEM_PROMPT, build_prompt, build_digest, candidates, digest_as_text
 from .push_service import PushService
 from .presentation import CHAT_GUIDANCE, format_overview, format_detail_source, is_campus_request, public_query_result
 from .media import CampusMedia
@@ -250,28 +250,45 @@ class YunshangPlugin(Star):
         # A background batch must not hold the interactive client's query lock.
         collector = CampusClient(self.config.get('cookie', ''), school=self.client.school,
                                  community=self.client.community, community_id=self.client.community_id)
+        comments_task, comments = None, {}
         try:
-            collection = await asyncio.wait_for(collector.fetch_window(start, end), timeout=70)
-        except CampusError as exc:
-            if exc.code == 'login_expired':
-                self.client.expired = True
-            raise
-        finally:
-            await collector.close()
-        if not collection['posts'] and (collection.get('scan_limited') or collection.get('invalid_dates')):
-            raise CampusError('incomplete_window', '本次时间范围未能完整确认，不能判断没有新帖')
-        reply = None
-        if collection['posts'] and self._cfg_bool('push_ai_enable', True):
             try:
-                provider_id = str(self.config.get('push_provider_id', '')).strip()
-                provider = self.context.get_provider_by_id(provider_id) if provider_id else self.context.get_using_provider()
-                budget = min(45, max(0, deadline - time.monotonic() - 55))
-                if provider and budget > 0:
-                    result = await asyncio.wait_for(provider.text_chat(prompt=build_prompt(collection['posts']), system_prompt=SYSTEM_PROMPT), timeout=budget)
-                    reply = getattr(result, 'completion_text', None)
-            except Exception as exc:
-                logger.warning('[云上校友圈] AI摘要不可用，采用原文摘录：%s', type(exc).__name__)
-        digest = build_digest(collection, start, end, community=self.client.community, ai_reply=reply, max_items=10)
+                collection = await asyncio.wait_for(collector.fetch_window(start, end), timeout=70)
+            except CampusError as exc:
+                if exc.code == 'login_expired':
+                    self.client.expired = True
+                raise
+            if not collection['posts'] and (collection.get('scan_limited') or collection.get('invalid_dates')):
+                raise CampusError('incomplete_window', '本次时间范围未能完整确认，不能判断没有新帖')
+            # Hot comments for the same Top10 the digest will pick; fetched while
+            # the model summarizes, and optional: failures only drop comments.
+            selected = [post['id'] for post in candidates(collection['posts'], limit=10)]
+            if selected:
+                comments_task = asyncio.create_task(
+                    asyncio.wait_for(collector.hot_comments(selected), timeout=15))
+            reply = None
+            if collection['posts'] and self._cfg_bool('push_ai_enable', True):
+                try:
+                    provider_id = str(self.config.get('push_provider_id', '')).strip()
+                    provider = self.context.get_provider_by_id(provider_id) if provider_id else self.context.get_using_provider()
+                    budget = min(45, max(0, deadline - time.monotonic() - 55))
+                    if provider and budget > 0:
+                        result = await asyncio.wait_for(provider.text_chat(prompt=build_prompt(collection['posts']), system_prompt=SYSTEM_PROMPT), timeout=budget)
+                        reply = getattr(result, 'completion_text', None)
+                except Exception as exc:
+                    logger.warning('[云上校友圈] AI摘要不可用，采用原文摘录：%s', type(exc).__name__)
+            if comments_task:
+                try:
+                    comments = await comments_task
+                except Exception as exc:
+                    logger.warning('[云上校友圈] 热评暂不可用，卡片不含评论：%s', type(exc).__name__)
+        finally:
+            if comments_task and not comments_task.done():
+                comments_task.cancel()
+                await asyncio.gather(comments_task, return_exceptions=True)
+            await collector.close()
+        digest = build_digest(collection, start, end, community=self.client.community, ai_reply=reply,
+                              max_items=10, comments=comments)
         if not digest['items']:
             return digest, []
         if self._cfg_bool('card_images_enable', True):
@@ -284,6 +301,7 @@ class YunshangPlugin(Star):
                     sum(bool(item.get('image_count')) for item in digest['items']),
                     sum(len(item.get('image_paths', [])) for item in digest['items']),
                     not digest['scan_limited'], digest['mode'])
+        logger.info('[云上校友圈] 热评：%s/%s 条入选帖附评论', sum(bool(item.get('comments')) for item in digest['items']), digest['shown'])
         name = 'preview-' + uuid.uuid4().hex if preview else 'batch-' + end.strftime('%Y%m%dT%H%M%S')
         output_dir = self._data_dir() / 'cards' / name
         try:
