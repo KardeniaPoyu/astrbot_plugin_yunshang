@@ -37,9 +37,16 @@ _GALLERY_HEIGHT = 360
 _GALLERY_GAP = 16
 _DETAIL_CHAR_LIMIT = 20_000
 _DETAIL_PAGE_LIMIT = 3
-_DETAIL_QR_EDGE = 430
-_DETAIL_QR_PAD = 16
-_DETAIL_QR_SPACE = 24 + _DETAIL_QR_EDGE + 2 * _DETAIL_QR_PAD + 16 + 26
+# Share-poster proportion: the code is ~20% of the card width, beside its call
+# to action, not a full-width block. 216px stays scannable from a phone screen.
+_DETAIL_QR_EDGE = 216
+_DETAIL_QR_PAD = 12
+_DETAIL_QR_TILE = _DETAIL_QR_EDGE + 2 * _DETAIL_QR_PAD
+_DETAIL_QR_FRAME = 8
+_DETAIL_QR_PANEL = _DETAIL_QR_TILE + 2 * (_DETAIL_QR_FRAME + 20)
+_DETAIL_CARD_TOP = 176
+_DETAIL_BODY_TOP = _DETAIL_CARD_TOP + 36 + 32 + 28
+_DETAIL_LINE = 42
 # Neutral text/surface tokens follow Lark (Feishu) UD; tags and alerts reuse
 # Ant Design v5 preset palettes, so the card reads like a familiar IM card.
 _BG = "#F2F3F5"
@@ -574,9 +581,9 @@ def _draw_item(canvas, item, y, gallery):
         canvas.picture(right - canvas.length(item["images"], 20) - 20, row, _TEXT_3)
 
 
-def _header(canvas, digest, hours):
-    """Brand band with a diagonal gradient and soft geometric accents."""
-    width, height = WIDTH * _SCALE, 300 * _SCALE
+def _band(canvas, height):
+    """Brand band with a horizontal gradient and soft geometric accents."""
+    width, height = WIDTH * _SCALE, height * _SCALE
     mask = Image.linear_gradient("L").rotate(90).resize((width, height))
     band = Image.composite(Image.new("RGB", (width, height), _BRAND),
                            Image.new("RGB", (width, height), _BRAND_DEEP), mask)
@@ -586,6 +593,10 @@ def _header(canvas, digest, hours):
         accent.ellipse(canvas._s((cx - r, cy - r, cx + r, cy + r)), fill=alpha)
     band.paste(Image.new("RGB", (width, height), "#FFFFFF"), mask=glow)
     canvas.image.paste(band)
+
+
+def _header(canvas, digest, hours):
+    _band(canvas, 300)
     canvas.text((56, 52), f"CAMPUS DIGEST·每 {hours} 小时", 19, "#C9D8FF", bold=True)
     heading = "校园墙高赞精选" if digest.get("ranking") == "likes" else "校园墙新帖速览"
     canvas.text((54, 92), heading, 52, "#FFFFFF", bold=True)
@@ -841,66 +852,99 @@ def _load_detail_qr(value):
             resources.callback(rgb.close)
             fit = min(_DETAIL_QR_EDGE / rgb.width, _DETAIL_QR_EDGE / rgb.height, 1)
             if fit < 1:
+                # Lanczos keeps the round sun-code dots smooth at a fractional
+                # scale; nearest-neighbour turns them into uneven blocks.
                 fitted = rgb.resize(tuple(max(1, round(edge * fit)) for edge in rgb.size),
-                                    Image.Resampling.NEAREST)
+                                    Image.Resampling.LANCZOS)
                 resources.callback(fitted.close)
             else:
-                fitted = rgb  # The official 430px code retains its original decoded pixels.
-            edge = _DETAIL_QR_EDGE + 2 * _DETAIL_QR_PAD
-            tile = Image.new("RGB", (edge, edge), "white")
-            tile.paste(fitted, ((edge - fitted.width) // 2, (edge - fitted.height) // 2))
+                fitted = rgb
+            tile = Image.new("RGB", (_DETAIL_QR_TILE, _DETAIL_QR_TILE), "white")
+            tile.paste(fitted, ((_DETAIL_QR_TILE - fitted.width) // 2,
+                                (_DETAIL_QR_TILE - fitted.height) // 2))
             return tile
     except (binascii.Error, ValueError, OSError, Image.DecompressionBombError):
         return None
 
 
+def _detail_chrome(metadata, gallery, qr):
+    """Heights around the body: (card bottom offset after body, page tail)."""
+    after_body = (28 + _GALLERY_HEIGHT if gallery else 0) + 28 + 1 + 20 + 28 + 32
+    if qr:
+        after_body += _DETAIL_QR_PANEL + 40
+        tail = 0
+    else:
+        tail = 24 + 36 + 30 * len(metadata["notice"])
+    return after_body, tail + 28 + 56
+
+
 def _detail_page(metadata, lines, fonts, page_index, pages, gallery, qr=None):
     """Render one bounded native page; no canvas survives its save/close cycle."""
-    note = 36 + 30 * len(metadata["notice"])
-    body_top = 352
-    bottom = body_top + 39 * len(lines) + (22 + _GALLERY_HEIGHT if gallery else 0) + 28
-    if qr is not None:
-        bottom += _DETAIL_QR_SPACE
-    height = bottom + 24 + note + 82
+    after_body, tail = _detail_chrome(metadata, gallery, qr is not None)
+    bottom = _DETAIL_BODY_TOP + _DETAIL_LINE * len(lines) + after_body
+    height = bottom + tail
     if height > MAX_HEIGHT:
         raise RenderError("Post detail page exceeds its maximum height")
+    left, right = 80, 1000
     canvas = _Canvas(fonts, height)
     try:
-        canvas.box((0, 0, WIDTH, 260), 0, _BRAND)
-        canvas.text((56, 40), "校园墙 · 原帖详情", 19, "#DCE6FF", bold=True)
-        canvas.text((54, 82), "帖子全文", 48, "#FFFFFF", bold=True)
-        canvas.text((56, 152), metadata["community"], 24, "#DCE6FF")
-        canvas.shadow((40, 232, 1040, bottom), 16, 26)
-        canvas.box((40, 232, 1040, bottom), 16, _SURFACE, _BORDER)
-        canvas.text((80, 270), metadata["source"], 22, _TEXT, anchor="lm")
-        canvas.text((1000, 270), metadata["when"], 20, _TEXT_3, anchor="rm")
-        canvas.text((80, 310), metadata["metrics"], 19, _TEXT_2, anchor="lm")
-        if metadata["images"]:
-            canvas.text((1000, 310), metadata["images"], 20, _TEXT_3, anchor="rm")
-            canvas.picture(980 - canvas.length(metadata["images"], 20), 310, _TEXT_3)
-        canvas.line(((80, 332), (1000, 332)), _DIVIDER)
-        row = body_top
+        _band(canvas, 240)
+        canvas.text((56, 44), "帖子全文·POST DETAIL", 19, "#C9D8FF", bold=True)
+        canvas.text((54, 80), metadata["community"], 44, "#FFFFFF", bold=True)
+        canvas.shadow((40, _DETAIL_CARD_TOP, 1040, bottom), 20, 30)
+        canvas.box((40, _DETAIL_CARD_TOP, 1040, bottom), 20, _SURFACE)
+
+        row = _DETAIL_CARD_TOP + 36
+        x = left
+        if metadata["category"]:
+            x += canvas.tag(x, row, metadata["category"], _tag_color(metadata["category"])) + 14
+        canvas.text((x, row + 16), metadata["source"], 20, _TEXT_3, anchor="lm")
+        canvas.text((right, row + 16), metadata["when"], 20, _TEXT_3, anchor="rm")
+        canvas.clock(right - canvas.length(metadata["when"], 20) - 18, row + 16, _TEXT_3)
+
+        row = _DETAIL_BODY_TOP
         for line in lines:
-            canvas.text((80, row), line, 26, _TEXT_2)
-            row += 39
+            canvas.text((left, row), line, 26, _TEXT)
+            row += _DETAIL_LINE
         if gallery:
-            row += 22
+            row += 28
             size = _gallery_size(len(gallery))
             for index, photo in enumerate(gallery):
-                canvas.thumbnail(80 + index * (size[0] + _GALLERY_GAP), row, photo, size)
+                canvas.thumbnail(left + index * (size[0] + _GALLERY_GAP), row, photo, size)
             row += _GALLERY_HEIGHT
+        row += 28
+        canvas.line(((left, row), (right, row)), _DIVIDER)
+        row += 20 + 14
+        canvas.text((left, row), metadata["metrics"], 20, _TEXT_2, anchor="lm")
+        if metadata["images"]:
+            canvas.text((right, row), metadata["images"], 20, _TEXT_3, anchor="rm")
+            canvas.picture(right - canvas.length(metadata["images"], 20) - 20, row, _TEXT_3)
+
         if qr is not None:
-            row += 24
-            canvas.image.paste(qr, ((WIDTH - qr.width) // 2, row))
-            canvas.text((WIDTH // 2, row + qr.height + 16), "微信扫码打开原帖",
-                        22, _TEXT_2, anchor="mt")
-        row = bottom + 24
-        canvas.box((40, row, 1040, row + note), 10, "#E9EBEE")
-        canvas.badge(68, row + 33, "i", _TEXT_3)
-        for index, line in enumerate(metadata["notice"]):
-            canvas.text((92, row + 33 + index * 30), line, 19, _TEXT_2, anchor="lm")
-        row += note + 52
-        canvas.text((44, row), "云上校友圈 · 原帖全文", 18, _TEXT_3, anchor="lm")
+            top = row + 14 + 32
+            canvas.box((left, top, right, top + _DETAIL_QR_PANEL), 14, "#F5F7FA")
+            frame = _DETAIL_QR_FRAME
+            tile_x, tile_y = right - 20 - frame - _DETAIL_QR_TILE, top + 20 + frame
+            canvas.box((tile_x - frame, tile_y - frame, tile_x + _DETAIL_QR_TILE + frame,
+                        tile_y + _DETAIL_QR_TILE + frame), 12, "#FFFFFF", _BORDER)
+            canvas.image.paste(qr, (tile_x, tile_y))
+            block = 40 + 14 + 30 + 22 + 30 * len(metadata["commands"])
+            text_y = top + (_DETAIL_QR_PANEL - block) // 2
+            canvas.text((left + 32, text_y), "微信扫码打开原帖", 30, _TEXT, bold=True)
+            canvas.text((left + 32, text_y + 54), "长按识别小程序码，查看评论与互动", 20, _TEXT_2)
+            for index, line in enumerate(metadata["commands"]):
+                canvas.text((left + 32, text_y + 106 + 30 * index), line, 19, _TEXT_3)
+            row = bottom + 28
+        else:
+            row = bottom + 24
+            note = 36 + 30 * len(metadata["notice"])
+            canvas.box((40, row, 1040, row + note), 10, "#E9EBEE")
+            canvas.badge(68, row + 33, "i", _TEXT_3)
+            for index, line in enumerate(metadata["notice"]):
+                canvas.text((92, row + 33 + index * 30), line, 19, _TEXT_2, anchor="lm")
+            row += note + 28
+        row += 28
+        canvas.text((44, row), "云上校友圈·帖子全文", 18, _TEXT_3, anchor="lm")
         canvas.text((1036, row), f"{page_index + 1} / {pages}", 20, _TEXT_2, bold=True, anchor="rm")
         return canvas.finish(height)
     except Exception:
@@ -921,8 +965,8 @@ def render_post_detail(post: dict, community, output_dir, font_path="") -> list[
     JPEG and optional ``gallery_count`` contract as the digest (at most three).
     Photos appear once, after the final body line, and unreadable files fall back
     gracefully. Optional ``mini_app_qr_data_url`` is the official JPEG data URL
-    (<=512 KiB decoded, <=1M pixels); its 430px code and quiet edges appear after
-    photos on the last page only. Invalid data omits that section. No source URL
+    (<=512 KiB decoded, <=1M pixels); it is scaled to 216px with a white quiet
+    zone, beside the call to action after photos on the last page only. Invalid data omits that section. No source URL
     or QR is synthesized. Canvases are saved/closed one at a time, without
     network access. On failure only this call's files are removed. Run in the
     caller's worker thread; catch RenderError for its full-text fallback.
@@ -932,8 +976,8 @@ def render_post_detail(post: dict, community, output_dir, font_path="") -> list[
         record = _detail_record(post)
         fonts = _Fonts(font_path)
 
-        def wrap(text, size, width, limit):
-            return _wrap(text, fonts.get(size), width, limit)
+        def wrap(text, size, width, limit, bold=False):
+            return _wrap(text, fonts.get(size, bold), width, limit)
 
         source_id = fonts.clean(record["id"], 128).replace("\n", " ")
         try:
@@ -947,16 +991,18 @@ def render_post_detail(post: dict, community, output_dir, font_path="") -> list[
             metrics += f" · 评论 {_metric_count(record['comment_count'])}"
         count = record["image_count"]
         images = f"配图{count if count < 1000 else '999+'}张" if count else ""
+        category = wrap(fonts.clean(record.get("category"), 64).replace("\n", " "), 19, 300, 1)[0]
         metadata = dict(
-            source=wrap("原帖 #" + source_id, 22, 520, 1)[0],
-            community=wrap(fonts.clean(community, 256).replace("\n", " "), 24, 960, 1)[0],
-            when=when, metrics=metrics, images=images,
-            notice=wrap(f"查看原帖：/校园墙 详情 {source_id}　查看配图：/校园墙 图片 {source_id}", 19, 900, 2))
+            source=wrap("原帖 #" + source_id, 20, 380, 1)[0],
+            community=wrap(fonts.clean(community, 256).replace("\n", " ") or "校园墙", 44, 960, 1, True)[0],
+            category=category, when=when, metrics=metrics, images=images,
+            notice=wrap(f"查看原帖：/校园墙 详情 {source_id}　查看配图：/校园墙 图片 {source_id}", 19, 900, 2),
+            commands=[wrap(f"全文  /校园墙 详情 {source_id}", 19, 560, 1)[0],
+                      wrap(f"配图  /校园墙 图片 {source_id}", 19, 560, 1)[0]])
         qr = _load_detail_qr(record.get("mini_app_qr_data_url"))
-        fixed_height = 352 + 28 + 24 + 36 + 30 * len(metadata["notice"]) + 82
-        gallery_space = 22 + _GALLERY_HEIGHT if _gallery_count(record) else 0
-        qr_space = _DETAIL_QR_SPACE if qr is not None else 0
-        per_page = (MAX_HEIGHT - fixed_height - gallery_space - qr_space) // 39
+        # Reserve the final page's photos and code on every page: simple and bounded.
+        after_body, tail = _detail_chrome(metadata, _gallery_count(record), qr is not None)
+        per_page = (MAX_HEIGHT - _DETAIL_BODY_TOP - after_body - tail) // _DETAIL_LINE
         if per_page < 1:
             raise RenderError("Post detail body region is too small")
         # Reserve final-page media before wrapping. Stop after one overflow line,

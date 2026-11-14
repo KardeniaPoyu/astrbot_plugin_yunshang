@@ -249,7 +249,7 @@ class CardsTests(unittest.TestCase):
         encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
         return "data:image/jpeg;base64," + encoded, buffer.getvalue()
 
-    def test_detail_official_qr_keeps_430_native_pixels_and_margin_after_photos(self):
+    def test_detail_official_qr_is_poster_sized_beside_its_prompt_after_photos(self):
         data_url, jpeg = self.synthetic_qr_url()
         photo = Path(self.temp.name) / "detail-before-qr.jpg"
         with Image.new("RGB", (160, 160), (17, 191, 70)) as sample:
@@ -269,16 +269,24 @@ class CardsTests(unittest.TestCase):
         self.assertEqual(len(paths), 1)
         self.assertEqual(body, [post["text"]])
         self.assertEqual(text.count("微信扫码打开原帖"), 1)
+        edge, pad = self.cards._DETAIL_QR_EDGE, self.cards._DETAIL_QR_PAD
         with Image.open(paths[0]) as rendered, Image.open(BytesIO(jpeg)) as decoded:
             qr_marker, pixels = self.color_region(rendered, (204, 14, 157))
             photo_box, _ = self.color_region(rendered, (17, 191, 70))
-            self.assertGreater(pixels, 100)
-            left, top = qr_marker[0] - 20, qr_marker[1] - 20
+            self.assertGreater(pixels, 20)
+            # The whole official code, scaled uniformly with Lanczos: never
+            # cropped, and its quiet edges stay white inside the tile padding.
+            expected = decoded.convert("RGB").resize((edge, edge), Image.Resampling.LANCZOS).tobytes()
+            matches = [(x, y) for x in range(qr_marker[0] - 16, qr_marker[0] - 4)
+                       for y in range(qr_marker[1] - 16, qr_marker[1] - 4)
+                       if rendered.crop((x, y, x + edge, y + edge)).tobytes() == expected]
+            self.assertEqual(len(matches), 1)
+            left, top = matches[0]
             self.assertGreater(top, photo_box[3])
-            # The full official 430px image survives byte-for-byte after JPEG
-            # decode, including all four quiet edges; it is never cropped/resized.
-            self.assertEqual(rendered.crop((left, top, left + 430, top + 430)).tobytes(), decoded.convert("RGB").tobytes())
-            self.assertEqual(rendered.getpixel((left - 8, top + 215)), (255, 255, 255))
+            self.assertEqual(rendered.getpixel((left - pad // 2, top + edge // 2)), (255, 255, 255))
+            # Poster proportion: about a fifth of the width, right of the prompt.
+            self.assertLess(edge, rendered.width // 4)
+            self.assertGreater(left, rendered.width // 2)
         for qr in loaded:
             with self.assertRaises(ValueError):
                 qr.getpixel((0, 0))
