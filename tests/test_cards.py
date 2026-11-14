@@ -158,7 +158,7 @@ class CardsTests(unittest.TestCase):
         self.assertEqual(len(paths), 1)
         self.assertEqual(body, post["text"].split("\n"))
         self.assertEqual(len(loaded), 3)
-        self.assertIn("配图4张", text)
+        self.assertIn("配图 4 张", text)
         for image in loaded:
             with self.assertRaises(ValueError):
                 image.getpixel((0, 0))
@@ -348,7 +348,7 @@ class CardsTests(unittest.TestCase):
                 self.assertLessEqual(im.height, 16000)
             self.assertLess(Path(path).stat().st_size, 2_000_000)
         for expected in ("本期展示", "12:00", "16:00", "北京时间", "AI",
-                         "12", "8", "可能还有遗漏", "配图2张", "1 / 1"):
+                         "12", "8", "可能还有遗漏", "配图 2 张", "1 / 1"):
             self.assertIn(expected, text)
         for i in range(1, 9):
             self.assertEqual(text.count(f"DEMO-{i:03}"), 1)
@@ -363,8 +363,8 @@ class CardsTests(unittest.TestCase):
         paths, text = self.render_with_text(digest)
         self.assertEqual(len(paths), 1)
         self.assertEqual(digest, before)
-        for expected in ("校园墙高赞精选", "本期精选", "按点赞优先", "每 4 小时",
-                         "点赞 128 · 蹲蹲 12 · 评论 7", "1 / 1"):
+        for expected in ("校园墙高赞精选", "本期精选", "按点赞排序", "每 4 小时更新",
+                         "点赞 128\n蹲蹲 12\n评论 7", "1 / 1"):
             self.assertIn(expected, text)
         self.assertNotIn("校园墙新帖速览", text)
         self.assertNotIn("可能还有遗漏", text)
@@ -375,7 +375,7 @@ class CardsTests(unittest.TestCase):
 
     def test_partial_ranked_digest_describes_incomplete_collection_without_disclaimers(self):
         _, text = self.render_with_text(fixture(4, ranking="likes", scan_limited=True))
-        self.assertIn("按已收集帖点赞优先", text)
+        self.assertIn("按点赞排序（已收集部分）", text)
         self.assertIn("仅展示已收集的新帖，可能还有遗漏", text)
         for banned in ("扫描未完成", "未经核实", "图片未识别", "附图未识别"):
             self.assertNotIn(banned, text)
@@ -390,7 +390,8 @@ class CardsTests(unittest.TestCase):
         _, text = self.render_with_text(digest)
         for expected in ("点赞 — · 蹲蹲 0", "点赞 0 · 蹲蹲 — · 评论 0",
                          "点赞 1.2万 · 蹲蹲 1亿 · 评论 9.9万", "点赞 — · 蹲蹲 —"):
-            self.assertIn(expected, text)
+            # Separators are drawn dots, so segments appear as consecutive draws.
+            self.assertIn(expected.replace(" · ", "\n"), text)
         self.assertNotIn("评论 —", text)
         self.assertNotIn("None", text)
 
@@ -402,9 +403,9 @@ class CardsTests(unittest.TestCase):
                         trace_count=10 ** 100, comment_count=10 ** 100)
         positions = []
         paths, text = self.render_with_text(digest, positions)
-        self.assertEqual(text.count("点赞 9999.9万 · 蹲蹲 999亿+"), 4)
+        self.assertEqual(text.count("点赞 9999.9万\n蹲蹲 999亿+"), 4)
         self.assertEqual(text.count("评论 999亿+"), 1, "Omit comments when the source needs the space")
-        self.assertEqual(text.count("配图999+张"), 4)
+        self.assertEqual(text.count("配图 999+ 张"), 4)
         footers = [(label, box) for label, box in positions
                    if label.startswith(("原帖 #", "点赞 ", "配图"))]
         self.assertEqual(len(footers), 12)
@@ -496,7 +497,7 @@ class CardsTests(unittest.TestCase):
                 paths, text = self.render_with_text(digest)
                 self.assertEqual(digest, before)
                 self.assertEqual(photo.read_bytes(), original)
-                self.assertIn("配图3张", text)
+                self.assertIn("配图 3 张", text)
                 with Image.open(paths[0]) as rendered:
                     boxes = []
                     for color in colors:
@@ -606,8 +607,8 @@ class CardsTests(unittest.TestCase):
             self.assertEqual(text.count(f"原帖 #DEMO-{i + 1:03}"), 1)
         self.assertNotIn("DEMO-011", text)
         self.assertLess(text.index("DEMO-009"), text.index("DEMO-010"))
-        self.assertIn("已展示 10 条入选帖 · 未展示 359 条", text)
-        self.assertNotIn("未展示 0 条", text)
+        self.assertIn("本期精选 10 条，另有 359 条未入选", text)
+        self.assertNotIn("另有 0 条", text)
         for page, path in enumerate(paths):
             with Image.open(path) as rendered:
                 self.assertEqual(rendered.width, 1080)
@@ -652,7 +653,7 @@ class CardsTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 previous.getpixel((0, 0))
         self.assertEqual(len(paths), 1)
-        self.assertIn("已展示 10 条入选帖 · 未展示 3 条", text)
+        self.assertIn("本期精选 10 条，另有 3 条未入选", text)
         self.assertEqual(text.count("原文节选"), 10)
         self.assertNotIn("完整原文末尾", text)
         self.assertNotIn("DEMO-011", text)
@@ -729,8 +730,8 @@ class CardsTests(unittest.TestCase):
 
     def test_interval_labels_follow_six_and_twenty_four_hour_windows(self):
         for end, masthead, footer in (
-            ("2026-11-12T10:00:00+00:00", "CAMPUS DIGEST·每 6 小时", "每 6 小时一辑"),
-            ("2026-11-13T04:00:00+00:00", "CAMPUS DIGEST·每 24 小时", "每 24 小时一辑"),
+            ("2026-11-12T10:00:00+00:00", "每 6 小时更新", "每 6 小时一辑"),
+            ("2026-11-13T04:00:00+00:00", "每 24 小时更新", "每 24 小时一辑"),
         ):
             with self.subTest(end=end):
                 _, text = self.render_with_text(fixture(1, window_end=end))

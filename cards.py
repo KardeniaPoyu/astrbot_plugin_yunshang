@@ -82,6 +82,17 @@ _TAG_KEYWORDS = (
     (("兼职", "实习", "招聘"), "cyan"),
 )
 _TAG_FALLBACK = ("geekblue", "cyan", "purple", "green", "blue")
+_SEP = " · "
+
+
+def _caps(text):
+    return text.isascii() and text.isupper() and len(text) > 1
+
+
+
+_SEP_WIDTH = 22  # 9px gap, 4px dot, 9px gap.
+_DOT = "#C9CDD4"
+_TRACKING = 1.5
 _AVATAR_COLORS = ("blue", "cyan", "green", "purple", "magenta", "orange", "geekblue", "volcano")
 _OPENING = frozenset("（【《〈「『〔［｛“‘([{«")
 _CLOSING = frozenset("，。！？；：、）】》〉」』〕］｝”’…,.!?;:)]}»")
@@ -424,6 +435,16 @@ class _Metrics:
     def length(self, text, size, bold=False):
         return self.font(size, bold).getlength(text) / _SCALE
 
+    def tracked(self, text, size, bold=False):
+        """Latin caps get letter spacing; CJK keeps the font's own spacing."""
+        if not _caps(text):
+            return self.length(text, size, bold)
+        return self.length(text, size, bold) + _TRACKING * max(0, len(text) - 1)
+
+    def meta_length(self, text, size, bold=False):
+        parts = text.split(_SEP)
+        return sum(self.tracked(part, size, bold) for part in parts) + _SEP_WIDTH * (len(parts) - 1)
+
 
 class _Canvas(_Metrics):
     """Native-resolution long canvas with anti-aliased text and local shadows."""
@@ -501,12 +522,40 @@ class _Canvas(_Metrics):
         """Initial-letter avatar; a 4x mask keeps the circle edge smooth at 1x."""
         initial = name[:1] or "同"
         _, _, color = _TAGS[_AVATAR_COLORS[sum(map(ord, name)) % len(_AVATAR_COLORS)]]
-        size = 2 * radius
+        self.disc(cx, cy, 2 * radius, color)
+        self.text((cx, cy), initial, round(radius * 0.95), "#FFFFFF", bold=True, anchor="mm")
+
+    def disc(self, cx, cy, diameter, color):
+        """Anti-aliased small circle: 4x mask, downsampled, at native scale."""
+        size = max(2, round(diameter))
+        x, y = round(cx - size / 2), round(cy - size / 2)
         with Image.new("L", (size * 4, size * 4), 0) as big:
             ImageDraw.Draw(big).ellipse((0, 0, size * 4 - 1, size * 4 - 1), fill=255)
             with big.resize((size, size), Image.LANCZOS) as mask:
-                self.image.paste(color, (cx - radius, cy - radius, cx + radius, cy + radius), mask)
-        self.text((cx, cy), initial, round(radius * 0.95), "#FFFFFF", bold=True, anchor="mm")
+                self.image.paste(color, (x, y, x + size, y + size), mask)
+
+    def meta(self, xy, text, size, fill=_TEXT_3, bold=False, anchor="lm", dot=_DOT):
+        """Metadata row: " · " separators become small drawn dots with even gaps.
+
+        The SC face draws every middle dot full-width, which spaces rows unevenly.
+        ``anchor`` is "lm", "mm" or "rm"; segments are drawn left to right.
+        """
+        x, y = xy
+        width = self.meta_length(text, size, bold)
+        x -= {"l": 0, "m": width / 2, "r": width}[anchor[0]]
+        for index, part in enumerate(text.split(_SEP)):
+            if index:
+                self.disc(x + _SEP_WIDTH / 2, y + 1, 4, dot)
+                x += _SEP_WIDTH
+            if _caps(part):
+                for char in part:
+                    self.text((x, y), char, size, fill, bold, "lm")
+                    x += self.length(char, size, bold) + _TRACKING
+                x -= _TRACKING
+            else:
+                self.text((x, y), part, size, fill, bold, "lm")
+                x += self.length(part, size, bold)
+        return width
 
     def chip(self, x, cy, label, background=_BRAND_SOFT, ink=_BRAND, size=16):
         width = self.length(label, size, True) + 14
@@ -615,16 +664,16 @@ def _item_layout(item, canvas, start, number, gallery_count):
     images = ""
     if item["image_count"]:
         count = str(item["image_count"]) if item["image_count"] < 1000 else "999+"
-        images = f"配图{count}张"
+        images = f"配图 {count} 张"
     metrics = f"点赞 {_metric_count(item.get('like_count'))} · 蹲蹲 {_metric_count(item.get('trace_count'))}"
     # Reserve the image counter, its icon and a 24px gap before fitting metrics.
     metrics_inset = canvas.length(images, 20) + 30 + 24 if images else 0
-    source_width = min(520, 920 - metrics_inset - canvas.length(metrics, 19) - 24)
+    source_width = min(520, 920 - metrics_inset - canvas.meta_length(metrics, 19) - 24)
     source = canvas.wrap("原帖 #" + clean(item["id"], 128).replace("\n", " "),
                          20, source_width, 1)[0]
     if item.get("comment_count") is not None:
         with_comments = metrics + f" · 评论 {_metric_count(item['comment_count'])}"
-        if canvas.length(with_comments, 19) <= 920 - metrics_inset - canvas.length(source, 20) - 24:
+        if canvas.meta_length(with_comments, 19) <= 920 - metrics_inset - canvas.length(source, 20) - 24:
             metrics = with_comments
     when = canvas.wrap(_published(item["published_at"], start), 20, 300, 1)[0]
     title_height = 44 * len(title) + 10 if title else 0
@@ -686,7 +735,7 @@ def _draw_item(canvas, item, y, gallery):
     canvas.line(((left, row), (right, row)), _DIVIDER)
     row += 16 + 12
     canvas.text((left, row), item["source"], 20, _TEXT_3, anchor="lm")
-    canvas.text((right - item["metrics_inset"], row), item["metrics"], 19, _TEXT_2, anchor="rm")
+    canvas.meta((right - item["metrics_inset"], row), item["metrics"], 19, _TEXT_2, anchor="rm")
     if item["images"]:
         canvas.text((right, row), item["images"], 20, _TEXT_3, anchor="rm")
         canvas.picture(right - canvas.length(item["images"], 20) - 20, row, _TEXT_3)
@@ -708,7 +757,7 @@ def _band(canvas, height):
 
 def _header(canvas, digest, hours):
     _band(canvas, 300)
-    canvas.text((56, 52), f"CAMPUS DIGEST·每 {hours} 小时", 19, "#C9D8FF", bold=True)
+    canvas.meta((56, 64), f"CAMPUS DIGEST · 每 {hours} 小时更新", 19, "#C9D8FF", bold=True, dot="#7F9CF5")
     heading = "校园墙高赞精选" if digest.get("ranking") == "likes" else "校园墙新帖速览"
     canvas.text((54, 92), heading, 52, "#FFFFFF", bold=True)
     community = canvas.wrap(canvas.fonts.clean(digest["community"], 256).replace("\n", " "), 24, 960, 1)[0]
@@ -727,18 +776,18 @@ def _overview(canvas, digest, start, end, shown, intro, y):
     for column in columns[1:]:
         canvas.line(((column - 32, y + 36), (column - 32, y + 140)), _DIVIDER, 2)
     ranked = digest.get("ranking") == "likes"
-    labels = ("统计时段（北京时间）", "已收集新帖", "本期精选" if ranked else "本期展示")
+    labels = ("统计时段", "收集新帖", "本期精选" if ranked else "本期展示")
     for column, label in zip(columns, labels):
         canvas.text((column, y + 34), label, 19, _TEXT_3)
     canvas.text((columns[0], y + 66), f"{start:%H:%M} – {end:%H:%M}", 38, _TEXT, bold=True)
-    canvas.text((columns[0], y + 120), date_label, 19, _TEXT_3)
+    canvas.meta((columns[0], y + 130), date_label + " · 北京时间", 19, _TEXT_3)
     total = str(digest["total"]) if digest["total"] < 1_000_000 else "999999+"
     for column, value in ((columns[1], total), (columns[2], str(shown))):
         canvas.text((column, y + 66), value, 38, _TEXT, bold=True)
         canvas.text((column + canvas.length(value, 38, True) + 6, y + 100), "条", 20, _TEXT_2, anchor="ls")
-    order = "按发布时间去重"
+    order = "按发布时间排序"
     if ranked:
-        order = "按已收集帖点赞优先" if digest["scan_limited"] else "按点赞优先"
+        order = "按点赞排序（已收集部分）" if digest["scan_limited"] else "按点赞排序"
     canvas.text((columns[1], y + 120), order, 19, _TEXT_3)
     if digest["mode"] == "ai":
         mode, colors = "AI 整理", _TAGS["blue"]
@@ -792,9 +841,10 @@ def _page(digest, start, end, items, fonts, shown, omitted):
     intro = probe.wrap(intro_text, 23, 880, 2)
     layouts = [_item_layout(item, probe, start, i + 1, _gallery_count(item))
                for i, item in enumerate(items)]
-    notice = probe.wrap("查看全文：/校园墙 详情 <帖子ID>　查看配图：/校园墙 图片 <帖子ID>",
+    notice = probe.wrap("发送「/校园墙 详情 帖子 ID」看全文，「/校园墙 图片 帖子 ID」看配图",
                         19, 900, 2)
-    notice.append(f"已展示 {shown} 条入选帖 · 未展示 {_metric_count(omitted)} 条")
+    if omitted:
+        notice.append(f"本期精选 {shown} 条，另有 {_metric_count(omitted)} 条未入选")
     overview_top = 232
     overview = 172 + 24 + 36 * len(intro) + 26
     top = overview_top + overview + 28
@@ -841,7 +891,7 @@ def _page(digest, start, end, items, fonts, shown, omitted):
         for i, line in enumerate(notice):
             canvas.text((92, y + 18 + 15 + 30 * i), line, 19, _TEXT_2, anchor="lm")
         y += note + 22 + 30
-        canvas.text((44, y), f"每 {hours} 小时一辑·云上校友圈", 18, _TEXT_3, anchor="lm")
+        canvas.meta((44, y), f"云上校友圈 · 每 {hours} 小时一辑", 18, _TEXT_3)
         label = "1 / 1"
         canvas.text((1036, y), label, 20, _TEXT_2, bold=True, anchor="rm")
         dots = 1036 - canvas.length(label, 20, True) - 18
@@ -1009,7 +1059,7 @@ def _detail_page(metadata, lines, fonts, page_index, pages, gallery, qr=None):
     canvas = _Canvas(fonts, height)
     try:
         _band(canvas, 240)
-        canvas.text((56, 44), "帖子全文·POST DETAIL", 19, "#C9D8FF", bold=True)
+        canvas.meta((56, 56), "POST DETAIL · 帖子全文", 19, "#C9D8FF", bold=True, dot="#7F9CF5")
         canvas.text((54, 80), metadata["community"], 44, "#FFFFFF", bold=True)
         canvas.shadow((40, _DETAIL_CARD_TOP, 1040, bottom), 20, 30)
         canvas.box((40, _DETAIL_CARD_TOP, 1040, bottom), 20, _SURFACE)
@@ -1035,7 +1085,7 @@ def _detail_page(metadata, lines, fonts, page_index, pages, gallery, qr=None):
         row += 28
         canvas.line(((left, row), (right, row)), _DIVIDER)
         row += 20 + 14
-        canvas.text((left, row), metadata["metrics"], 20, _TEXT_2, anchor="lm")
+        canvas.meta((left, row), metadata["metrics"], 20, _TEXT_2)
         if metadata["images"]:
             canvas.text((right, row), metadata["images"], 20, _TEXT_3, anchor="rm")
             canvas.picture(right - canvas.length(metadata["images"], 20) - 20, row, _TEXT_3)
@@ -1064,8 +1114,9 @@ def _detail_page(metadata, lines, fonts, page_index, pages, gallery, qr=None):
             text_y = top + (_DETAIL_QR_PANEL - block) // 2
             canvas.text((left + 32, text_y), "微信扫码打开原帖", 30, _TEXT, bold=True)
             canvas.text((left + 32, text_y + 54), "长按识别小程序码，查看评论与互动", 20, _TEXT_2)
-            for index, line in enumerate(metadata["commands"]):
-                canvas.text((left + 32, text_y + 106 + 30 * index), line, 19, _TEXT_3)
+            for index, (label, command) in enumerate(metadata["commands"]):
+                canvas.text((left + 32, text_y + 106 + 30 * index), label, 19, _TEXT_3)
+                canvas.text((left + 104, text_y + 106 + 30 * index), command, 19, _TEXT_2)
             row = bottom + 28
         else:
             row = bottom + 24
@@ -1076,7 +1127,7 @@ def _detail_page(metadata, lines, fonts, page_index, pages, gallery, qr=None):
                 canvas.text((92, row + 33 + index * 30), line, 19, _TEXT_2, anchor="lm")
             row += note + 28
         row += 28
-        canvas.text((44, row), "云上校友圈·帖子全文", 18, _TEXT_3, anchor="lm")
+        canvas.meta((44, row), "云上校友圈 · 帖子全文", 18, _TEXT_3)
         canvas.text((1036, row), f"{page_index + 1} / {pages}", 20, _TEXT_2, bold=True, anchor="rm")
         return canvas.finish(height)
     except Exception:
@@ -1122,15 +1173,15 @@ def render_post_detail(post: dict, community, output_dir, font_path="") -> list[
         if record.get("comment_count") is not None:
             metrics += f" · 评论 {_metric_count(record['comment_count'])}"
         count = record["image_count"]
-        images = f"配图{count if count < 1000 else '999+'}张" if count else ""
+        images = f"配图 {count if count < 1000 else '999+'} 张" if count else ""
         category = wrap(fonts.clean(record.get("category"), 64).replace("\n", " "), 19, 300, 1)[0]
         metadata = dict(
             source=wrap("原帖 #" + source_id, 20, 380, 1)[0],
             community=wrap(fonts.clean(community, 256).replace("\n", " ") or "校园墙", 44, 960, 1, True)[0],
             category=category, when=when, metrics=metrics, images=images,
-            notice=wrap(f"查看原帖：/校园墙 详情 {source_id}　查看配图：/校园墙 图片 {source_id}", 19, 900, 2),
-            commands=[wrap(f"全文  /校园墙 详情 {source_id}", 19, 560, 1)[0],
-                      wrap(f"配图  /校园墙 图片 {source_id}", 19, 560, 1)[0]])
+            notice=wrap(f"发送「/校园墙 详情 {source_id}」看全文，「/校园墙 图片 {source_id}」看配图", 19, 900, 2),
+            commands=[("看全文", wrap(f"/校园墙 详情 {source_id}", 19, 480, 1)[0]),
+                      ("看配图", wrap(f"/校园墙 图片 {source_id}", 19, 480, 1)[0])])
         probe = _Metrics(fonts)
         comments = record.get("comments") if isinstance(record.get("comments"), list) else []
         metadata["comments"] = _comment_layout(probe, comments, 920, 6, 3)
